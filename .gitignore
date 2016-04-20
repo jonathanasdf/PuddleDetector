@@ -26,3 +26,9 @@
 *.exe
 *.out
 *.app
+
+# CMake garbage
+CMakeFiles
+CMakeCache.txt
+Makefile
+cmake_install.cmake
