@@ -15,6 +15,10 @@
 
 #include "puddle.h"
 
+using namespace cv;
+using namespace std;
+using namespace pcl;
 int main(int argc, char **argv) {
     std::cout << "Hello world!" << std::endl;
+    return 0;
 }
