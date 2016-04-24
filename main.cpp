@@ -44,13 +44,16 @@ void loadData() {
     }
     cout << "Data load success!" << endl;
 }
+ts stots(string s) {
+    return stold(s);
+}
 path getClosestFrame(string frame, DataMap &map) {
-    auto ptr2 = map.lower_bound(frame);
-    auto ptr = ptr2++;
-    if (ptr2 == map.end()) return ptr->second;
-    ts timestamp = stold(frame);
-    ts d1 = abs(timestamp - stold(ptr->first));
-    ts d2 = abs(timestamp - stold(ptr2->first));
+    auto ptr = map.upper_bound(frame);
+    if (ptr == map.begin()) return ptr->second;
+    auto ptr2 = ptr--;
+    ts timestamp = stots(frame);
+    ts d1 = abs(timestamp - stots(ptr->first));
+    ts d2 = abs(timestamp - stots(ptr2->first));
     return d1 < d2 ? ptr->second : ptr2->second;
 }
 int main(int argc, char **argv) {
@@ -59,14 +62,13 @@ int main(int argc, char **argv) {
 
     char video[] = "video";
     cvNamedWindow(video);
-    pcl::visualization::CloudViewer pcl_viewer("pointcloud");
 
     ts last_frame_time = -1;
     for(auto p : left_img_paths) {
         string frame = p.first;
         if (!right_img_paths.count(frame)) continue;
 
-        ts timestamp = stold(frame);
+        ts timestamp = stots(frame);
         if (last_frame_time != -1) {
           cvWaitKey((timestamp - last_frame_time) * 1000);
         }
@@ -84,7 +86,7 @@ int main(int argc, char **argv) {
         auto lidar_path = getClosestFrame(frame, lidar_paths);
         pcl::PointCloud<pcl::PointXYZ>::Ptr lidar (new pcl::PointCloud<pcl::PointXYZ>);
         pcl::io::loadPCDFile<pcl::PointXYZ> (lidar_path.string(), *lidar);
-        pcl_viewer.showCloud(lidar);
+        cout << lidar->points.size() << " points loaded." << endl;
     }
     cvWaitKey();
     return 0;
