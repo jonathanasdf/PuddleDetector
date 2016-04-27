@@ -30,7 +30,7 @@ typedef double ts;
 
 /************************* GLOBAL VARIABLES ************************/
 // Data paths
-map<string, path> left_img_paths, right_img_paths, lidar_paths;
+map<ts, path> left_img_paths, right_img_paths, lidar_paths;
 const string pose_path = "data/odom_clean.dat";
 
 // extrinsic calibration
@@ -50,24 +50,28 @@ const double focal_length = 469.1630, // pixels
                        cy = 285.5;
 
 // poses
-map<string, Eigen::Matrix4d> poses;
+map<ts, Eigen::Matrix4d> poses;
 /*********************** END GLOBAL VARIABLES **********************/
 
+// string to timestamp
+ts stots(string s) {
+    return stod(s);
+}
 void loadData() {
     for (auto i = directory_iterator(path("data")), end = directory_iterator(); i != end; i++) {
         path file = i->path();
         string filename = file.filename().string();
         if (boost::starts_with(filename, "left")) {
-            left_img_paths[filename.substr(11, 20)] = file;
+            left_img_paths[stots(filename.substr(11, 20))] = file;
         } else if (boost::starts_with(filename, "right")) {
-            right_img_paths[filename.substr(12, 20)] = file;
+            right_img_paths[stots(filename.substr(12, 20))] = file;
         } else if (boost::starts_with(filename, "lidar")) {
-            lidar_paths[filename.substr(12, 20)] = file;
+            lidar_paths[stots(filename.substr(12, 20))] = file;
         }
     }
 
     std::ifstream pose_in(pose_path);
-    string t;
+    ts t;
     while(pose_in >> t) {
         Eigen::Matrix4d T;
         for(int i=0; i<4; i++) {
@@ -80,17 +84,12 @@ void loadData() {
     pose_in.close();
     cout << "Data load success!" << endl;
 }
-// string to timestamp
-ts stots(string s) {
-    return stod(s);
-}
-template<typename T> T getClosestFrame(string frame, map<string, T> &map) {
+template<typename T> T getClosestFrame(ts frame, map<ts, T> &map) {
     auto ptr = map.upper_bound(frame);
     if (ptr == map.begin()) return ptr->second;
     auto ptr2 = ptr--;
-    ts timestamp = stots(frame);
-    ts d1 = abs(timestamp - stots(ptr->first));
-    ts d2 = abs(timestamp - stots(ptr2->first));
+    ts d1 = abs(frame - ptr->first);
+    ts d2 = abs(frame - ptr2->first);
     return d1 < d2 ? ptr->second : ptr2->second;
 }
 int main(int argc, char **argv) {
@@ -101,14 +100,14 @@ int main(int argc, char **argv) {
 
     ts last_frame_time = -1;
     for(auto p : left_img_paths) {
-        string frame = p.first;
+        ts frame = p.first;
         if (!right_img_paths.count(frame)) continue;
 
-        ts timestamp = stots(frame);
         if (last_frame_time != -1) {
-          cvWaitKey((timestamp - last_frame_time) * 1000);
+          cvWaitKey((frame - last_frame_time) * 1000);
         }
-        last_frame_time = timestamp;
+        last_frame_time = frame;
+        cout << "Current time: " << frame << endl;
 
         auto left = imread(left_img_paths[frame].string());
         auto right = imread(left_img_paths[frame].string());
