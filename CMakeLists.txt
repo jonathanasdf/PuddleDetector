@@ -3,7 +3,7 @@ set (CMAKE_CXX_STANDARD 11)
 project(puddle)
 
 find_package(PCL 1.8 REQUIRED)
-find_package(OpenCV 2.4 REQUIRED)
+find_package(OpenCV 3.1 REQUIRED)
 find_package(Boost REQUIRED)
 
 include_directories(${PCL_INCLUDE_DIRS})
