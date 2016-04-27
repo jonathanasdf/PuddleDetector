@@ -27,24 +27,34 @@ using namespace cv;
 using namespace pcl;
 using namespace std;
 typedef double ts;
-typedef map<string, path> DataMap;
+
 /************************* GLOBAL VARIABLES ************************/
 // Data paths
-DataMap left_img_paths, right_img_paths, lidar_paths;
-string pose_path;
+map<string, path> left_img_paths, right_img_paths, lidar_paths;
+const string pose_path = "data/odom_clean.dat";
+
 // extrinsic calibration
-Eigen::Matrix4d T_vehicle_lidar, T_vehicle_camera_left;
+Eigen::Matrix4d T_vehicle_lidar       {{0,      -1,       0,  0.0170},
+                                       {1,       0,       0, -0.0270},
+                                       {0,       0,       1,  0.0370},
+                                       {0,       0,       0,       1}};
+
+Eigen::Matrix4d T_vehicle_camera_left {{1,       0,       0, -0.0140},
+                                       {0, -0.2215,  0.9751,  0.0282},
+                                       {0, -0.9751, -0.2215, -0.0100},
+                                       {0,       0,       0,       1}};
+
 // intrinsic calibration
 const double focal_length = 469.1630, // pixels
-      cx = 508.5,
-      cy = 285.5;
+                       cx = 508.5,
+                       cy = 285.5;
 
 // poses
-map<ts, Eigen::Matrix4d*> poses;
+map<string, Eigen::Matrix4d> poses;
 /*********************** END GLOBAL VARIABLES **********************/
+
 void loadData() {
-    path datadir("data");
-    for (auto i = directory_iterator(datadir), end = directory_iterator(); i != end; i++) {
+    for (auto i = directory_iterator(path("data")), end = directory_iterator(); i != end; i++) {
         path file = i->path();
         string filename = file.filename().string();
         if (boost::starts_with(filename, "left")) {
@@ -55,14 +65,14 @@ void loadData() {
             lidar_paths[filename.substr(12, 20)] = file;
         }
     }
-    std::ifstream pose_in(pose_path);
-    double t;
 
+    std::ifstream pose_in(pose_path);
+    string t;
     while(pose_in >> t) {
-        Eigen::Matrix4d *T = new Eigen::Matrix4d;
+        Eigen::Matrix4d T;
         for(int i=0; i<4; i++) {
             for(int j=0; j<4; j++) {
-                pose_in >> (*T)(i,j);
+                pose_in >> T(i,j);
             }
         }
         poses[t] = T;
@@ -70,10 +80,11 @@ void loadData() {
     pose_in.close();
     cout << "Data load success!" << endl;
 }
+// string to timestamp
 ts stots(string s) {
-    return stold(s);
+    return stod(s);
 }
-path getClosestFrame(string frame, DataMap &map) {
+template<typename T> T getClosestFrame(string frame, map<string, T> &map) {
     auto ptr = map.upper_bound(frame);
     if (ptr == map.begin()) return ptr->second;
     auto ptr2 = ptr--;
@@ -83,19 +94,6 @@ path getClosestFrame(string frame, DataMap &map) {
     return d1 < d2 ? ptr->second : ptr2->second;
 }
 int main(int argc, char **argv) {
-    if(argc < 2) {
-        cout << "Usage: PuddleDetector path/to/posefilename.txt" << endl;
-        return 1;
-    }
-    T_vehicle_lidar << 0, -1, 0, 0.0170,
-                    1, 0, 0, -0.0270,
-                    0, 0, 1, 0.0370,
-                    0, 0, 0, 1;
-    T_vehicle_camera_left << 1, 0, 0, -0.0140,
-                         0, -0.2215, 0.9751, 0.0282,
-                         0, -0.9751, -0.2215, -0.0100,
-                         0, 0, 0, 1;
-    pose_path = argv[1];
     loadData();
 
     char video[] = "video";
@@ -125,6 +123,8 @@ int main(int argc, char **argv) {
         pcl::PointCloud<pcl::PointXYZ>::Ptr lidar (new pcl::PointCloud<pcl::PointXYZ>);
         pcl::io::loadPCDFile<pcl::PointXYZ> (lidar_path.string(), *lidar);
         cout << lidar->points.size() << " points loaded." << endl;
+
+        cout << "Current pose: " << getClosestFrame(frame, poses) << endl;
     }
     cvWaitKey();
     return 0;
