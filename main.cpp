@@ -41,14 +41,17 @@ typedef PointCloud<PointXYZ> Cloud;
 
 /************************* GLOBAL VARIABLES ************************/
 // Configuration
-const int num_frames_to_keep = 10;
-const int min_lidar_frames_needed = 3;
+const int num_frames_to_keep = 20;
+const int min_lidar_frames_needed = 5;
 const int ransac_iterations = 300;
 const float voxel_size = 0.1; // m or lidar units
+const int histogram_size = 30,
+      histogram_offset = 40;
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
-             ground_distance_thresh = 0.5; // m
+             ground_distance_thresh = 0.1, // m
+             road_width = 3.0;
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -152,29 +155,57 @@ vector<Point> project(
     return pixels;
 }
 void getGroundPlane(Cloud::ConstPtr in_cloud,
+                    const_pose_p pose,
                     Cloud::Ptr ground_cloud,
                     Cloud::Ptr stuff_cloud) {
-   ModelCoefficients coefficients;
-   PointIndices::Ptr inliers(new PointIndices);
-   // segment it!
-   SACSegmentation<PointXYZ> seg;
-   seg.setOptimizeCoefficients(true);
-   seg.setModelType(SACMODEL_PLANE);
-   seg.setMethodType(SAC_RANSAC);
-   seg.setDistanceThreshold(ground_distance_thresh);
-   seg.setMaxIterations(ransac_iterations);
-   seg.setInputCloud(in_cloud);
-   seg.segment(*inliers, coefficients);
-   cout << coefficients << endl;
+    /*
+    ModelCoefficients coefficients;
+    PointIndices::Ptr inliers(new PointIndices);
+    // segment it!
+    SACSegmentation<PointXYZ> seg;
+    seg.setOptimizeCoefficients(true);
+    seg.setModelType(SACMODEL_PLANE);
+    seg.setMethodType(SAC_RANSAC);
+    seg.setDistanceThreshold(ground_distance_thresh);
+    seg.setMaxIterations(ransac_iterations);
+    seg.setInputCloud(in_cloud);
+    seg.segment(*inliers, coefficients);
+    cout << coefficients << endl;
 
-   // extract the plane into a new point cloud
-   ExtractIndices<PointXYZ> extract;
-   extract.setInputCloud(in_cloud);
-   extract.setIndices(inliers);
-   extract.setNegative(false);
-   extract.filter(*ground_cloud);
-   extract.setNegative(true);
-   extract.filter(*stuff_cloud);
+    // extract the plane into a new point cloud
+    ExtractIndices<PointXYZ> extract;
+    extract.setInputCloud(in_cloud);
+    extract.setIndices(inliers);
+    extract.setNegative(false);
+    extract.filter(*ground_cloud);
+    extract.setNegative(true);
+    extract.filter(*stuff_cloud);
+    */
+    double pose_z = (*pose)(2,3);
+    cout << pose_z << endl;
+    vector<int> histogram(histogram_size, 0);
+    for(auto p : in_cloud->points) {
+        if(abs(p.x) < road_width) {
+            int z = round((p.z + pose_z)/ground_distance_thresh) + histogram_offset;
+            if(z >= 0 && z < histogram_size) histogram[z]++;
+        }
+    }
+    int hist_max = 0, mode = 0;
+    for(int i=0; i<histogram_size; i++) {
+        if(histogram[i] > hist_max) {
+            hist_max = histogram[i];
+            mode = i;
+        }
+    }
+    double ground_height = (mode - histogram_offset) * ground_distance_thresh;
+    cout << ground_height << endl;
+    for(auto p : in_cloud->points) {
+        if(abs(p.z + pose_z - ground_height) < ground_distance_thresh) {
+            ground_cloud->push_back(p);
+        } else {
+            stuff_cloud->push_back(p);
+        }
+    }
 }
 // Clean and transform lidar cloud into global frame with dewarp
 void processLidar(Cloud::Ptr lidar, ts frame) {
@@ -189,6 +220,7 @@ void processLidar(Cloud::Ptr lidar, ts frame) {
     int n = lidar->size();
     for(int i=0; i<n; i++) {
         auto pt = lidar->at(i);
+        if(pt.x < 0) continue;
         if(pt.x*pt.x + pt.y*pt.y + pt.z*pt.z < lidar_near_sqr_thresh) {
             continue;
         }
@@ -241,10 +273,11 @@ Mat processFrame(const deque<Mat> &camera_frames,
     voxels.setLeafSize(voxel_size, voxel_size, voxel_size);
     voxels.filter(*lidar_filtered);
 
-    Cloud::Ptr ground(new Cloud), otherstuff(new Cloud);
-    getGroundPlane(lidar_filtered, ground, otherstuff);
-
     auto pose = pose_frames[0];
+
+    Cloud::Ptr ground(new Cloud), otherstuff(new Cloud);
+    getGroundPlane(lidar_filtered, pose, ground, otherstuff);
+
     /*
     vector<Point> pixels, hull;
     for(auto pt : ground->points) {
