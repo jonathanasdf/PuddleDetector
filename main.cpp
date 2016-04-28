@@ -19,14 +19,15 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 
+#include <pcl/common/transforms.h>
+#include <pcl/filters/approximate_voxel_grid.h>
+#include <pcl/filters/extract_indices.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
-#include <pcl/filters/approximate_voxel_grid.h>
-#include <pcl/visualization/cloud_viewer.h>
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/sample_consensus/model_types.h>
 #include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/filters/extract_indices.h>
+#include <pcl/visualization/cloud_viewer.h>
 
 using namespace boost::filesystem;
 using namespace cv;
@@ -36,14 +37,17 @@ typedef double ts;
 typedef PointCloud<PointXYZ> Cloud;
 typedef shared_ptr<Eigen::Matrix4d> pose_p;
 typedef shared_ptr<const Eigen::Matrix4d> const_pose_p;
+typedef PointCloud<PointXYZ> Cloud;
 
 /************************* GLOBAL VARIABLES ************************/
 // Configuration
 const int num_frames_to_keep = 10;
+const int min_lidar_frames_needed = 5;
+const double voxel_size = 0.1; // m or lidar units
 
 // thresholds
-const double lidar_near_sqr_thresh = 1,
-             ground_distance_thresh = 0.1;
+const double lidar_near_sqr_thresh = 4, // m^2
+             ground_distance_thresh = 0.1; // m
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -60,14 +64,17 @@ Eigen::Matrix4d T_vehicle_camera_left {{1,       0,       0, -0.0140},
                                        {0, -0.9751, -0.2215, -0.0100},
                                        {0,       0,       0,       1}};
 
-// intrinsic calibration
+// intrinsic calibration and sensor properties
 const double focal_length = 469.1630, // pixels
-                       cx = 508.5,
-                       cy = 285.5;
+                       cx = 508.5, // pixels
+                       cy = 285.5; // pixels
+
 Eigen::Matrix<double, 3, 4> T_projection {{focal_length, 0, cx, 0},
                                           {0, focal_length, cy, 0},
                                           {0, 0,             1, 0}};
 
+const ts lidar_cloud_time = 0.1; // seconds or ts units
+const int lidar_num_lasers = 64;
 // poses
 map<ts, pose_p> poses;
 
@@ -78,14 +85,14 @@ ts stots(string s) {
     return stod(s);
 }
 void loadData() {
-    for (auto i = directory_iterator(path("data")), end = directory_iterator(); i != end; i++) {
+    for(auto i = directory_iterator(path("data")), end = directory_iterator(); i != end; i++) {
         path file = i->path();
         string filename = file.filename().string();
-        if (boost::starts_with(filename, "left")) {
+        if(boost::starts_with(filename, "left")) {
             left_img_paths[stots(filename.substr(11, 20))] = file;
-        } else if (boost::starts_with(filename, "right")) {
+        } else if(boost::starts_with(filename, "right")) {
             right_img_paths[stots(filename.substr(12, 20))] = file;
-        } else if (boost::starts_with(filename, "lidar")) {
+        } else if(boost::starts_with(filename, "lidar")) {
             lidar_paths[stots(filename.substr(12, 20))] = file;
         }
     }
@@ -102,12 +109,13 @@ void loadData() {
         poses[t] = move(T);
     }
     pose_in.close();
-    cout << "Data load success!" << endl;
+    cerr << "Data load success!" << endl;
 }
 template<typename T> T getClosestFrame(ts frame, map<ts, T> &map) {
     auto ptr = map.upper_bound(frame);
-    if (ptr == map.begin()) return ptr->second;
+    if(ptr == map.begin()) return ptr->second;
     auto ptr2 = ptr--;
+    if(ptr == map.end()) return ptr->second;
     ts d1 = abs(frame - ptr->first);
     ts d2 = abs(frame - ptr2->first);
     return d1 < d2 ? ptr->second : ptr2->second;
@@ -116,6 +124,7 @@ template<typename T> T getClosestFrame(ts frame, map<ts, T> &map) {
 Eigen::Matrix4d T_lidar_global(const_pose_p pose) {
     return *pose * T_vehicle_lidar.inverse();
 }
+
 // Get transform from global frame to image pixel
 Eigen::Matrix<double, 3, 4> T_global_image(const_pose_p pose) {
     return T_projection * T_vehicle_camera_left * pose->inverse();
@@ -143,23 +152,100 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
    extract.setNegative(true);
    extract.filter(*stuff_cloud);
 }
+// Clean and transform lidar cloud into global frame with dewarp
+void processLidar(Cloud::Ptr lidar, ts frame) {
+    cerr << "Processing lidar... ";
+    // filter out shitty points
+    PointIndices::Ptr ind(new PointIndices);
+    int n = lidar->size();
+    for(int i=0; i<n; i++) {
+        auto pt = lidar->at(i);
+        if(pt.x < 0) continue; // remove points behind vehicle
+        if(pt.x*pt.x + pt.y*pt.y + pt.z*pt.z < lidar_near_sqr_thresh) continue;
+        ind->indices.push_back(i);
+    }
+
+    // transform cloud to desired locations
+    auto ptr = poses.upper_bound(frame);
+    if(ptr == poses.begin() || ptr == poses.end()) {
+        // no need to de-warp at the beginning
+        if(ptr == poses.end()) ptr--;
+        transformPointCloud(*lidar, ind->indices, *lidar, T_lidar_global(ptr->second));
+    } else {
+        cerr << "dewarping... ";
+        auto ptr2 = ptr--;
+        auto t1 = ptr->first, t2 = ptr2->first;
+        assert(t1 <= frame && t2 > frame);
+        auto T1 = T_lidar_global(ptr->second),
+             T2 = T_lidar_global(ptr2->second);
+        Cloud::Ptr temp_cloud(new Cloud),
+                   temp_cloud2(new Cloud);
+        transformPointCloud(*lidar, ind->indices, *temp_cloud, T1);
+        transformPointCloud(*lidar, ind->indices, *temp_cloud2, T2);
+        for(int i=0; i<temp_cloud->size(); i++) {
+            // interpolate between transformed positions
+            PointXYZ p1 = temp_cloud->at(i), p2 = temp_cloud2->at(i);
+            ts point_time = frame +
+                lidar_cloud_time * (ind->indices[i]/lidar_num_lasers) / (n*1.0/lidar_num_lasers);
+            ts s2 = (point_time - t1)/(t2 - t1),
+               s1 = 1.0 - s2;
+            lidar->at(i).x = p1.x * s1 + p2.x * s2;
+            lidar->at(i).y = p1.y * s1 + p2.y * s2;
+            lidar->at(i).z = p1.z * s1 + p2.z * s2;
+        }
+    }
+    cerr << "lidar processed. " << n - lidar->size() << " points filtered." << endl;
+}
 Mat processFrame(const deque<Mat> &camera_frames,
                  const deque<const_pose_p> &pose_frames,
                  const deque<Cloud::ConstPtr> &lidar_frames) {
-    Mat out(camera_frames[0]);
-    Cloud::Ptr ground(new Cloud), stuff(new Cloud);
-    getGroundPlane(lidar_frames[0], ground, stuff);
+    // accumulate scans, downsample, and segment ground
+    Cloud::Ptr lidar_aggregation(new Cloud);
+    for(auto lidar : lidar_frames) {
+        *lidar_aggregation += *lidar;
+    }
+
+    /*
+    Cloud::Ptr lidar_filtered;
+    ApproximateVoxelGrid<Cloud> voxels;
+    voxels.setInputCloud(lidar_aggregation);
+    voxels.setLeafSize(voxel_size);
+    voxels.filter(*lidar_filtered);
+    */
+
+    Cloud::Ptr ground(new Cloud), otherstuff(new Cloud);
+    getGroundPlane(lidar_aggregation, ground, otherstuff);
+
+    auto pose = pose_frames[0];
     vector<Point> pixels, hull;
-    for (auto pt : ground->points) {
-        auto pose = pose_frames[0];
-        Eigen::Vector3d pixel_hom = T_global_image(pose) * T_lidar_global(pose) * pt.getVector4fMap().cast<double>();
+    for(auto pt : ground->points) {
+        Eigen::Vector3d pixel_hom = T_global_image(pose) * pt.getVector4fMap().cast<double>();
         Point2d pixel(pixel_hom(0)/pixel_hom(2), pixel_hom(1)/pixel_hom(2));
         pixels.push_back(pixel);
     }
     convexHull(pixels, hull);
-    for (int j=0; j < out.rows; j++) {
-        for (int i=0; i < out.cols; i++) {
-            if (pointPolygonTest(hull, Point2d(i, j), false) >= 0) {
+
+    Mat out(camera_frames[0]);
+    for (auto pt : ground->points) {
+        Eigen::Vector3d pixel = T_global_image(pose) * pt.getVector4fMap().cast<double>();
+        // draw
+        Point cvpt;
+        cvpt.x = pixel[0]/pixel[2];
+        cvpt.y = pixel[1]/pixel[2];
+        circle(out, cvpt, 3, Scalar(0, 50, 200), 1, 8, 0);
+    }
+    for (auto pt : otherstuff->points) {
+        Eigen::Vector3d pixel = T_global_image(pose) * pt.getVector4fMap().cast<double>();
+        // draw
+        Point cvpt;
+        cvpt.x = pixel[0]/pixel[2];
+        cvpt.y = pixel[1]/pixel[2];
+        circle(out, cvpt, 3, Scalar(255, 50, 0), 1, 8, 0);
+    }
+
+    for(int j=0; j < out.rows; j++) {
+        for(int i=0; i < out.cols; i++) {
+            if(pointPolygonTest(hull, Point2d(i, j), false) >= 0) {
                 auto &color = out.at<Vec3b>(j, i);
                 color[0] = 255;
                 color[1] = 0;
@@ -169,7 +255,6 @@ Mat processFrame(const deque<Mat> &camera_frames,
     }
     return out;
 }
-
 int main(int argc, char **argv) {
     loadData();
 
@@ -182,11 +267,12 @@ int main(int argc, char **argv) {
 
     ts last_frame_timestamp = -1;
     auto last_frame_time = chrono::high_resolution_clock::now();
+    auto lidar_path_it = lidar_paths.begin();
     for(auto p : left_img_paths) {
         // frame timing
         ts frame = p.first;
         auto current_time = chrono::high_resolution_clock::now();
-        if (last_frame_timestamp != -1) {
+        if(last_frame_timestamp != -1) {
             auto timestamp_diff = frame - last_frame_timestamp;
             auto time_diff = chrono::duration<double>(current_time - last_frame_time).count();
             auto wait = max(1., (timestamp_diff - time_diff) * 1000);
@@ -194,38 +280,43 @@ int main(int argc, char **argv) {
         }
         last_frame_timestamp = frame;
         last_frame_time = chrono::high_resolution_clock::now();
-        cout << fixed << "Current frame: " << frame << endl;
+        cerr << fixed << "Current frame: " << frame << endl;
 
         // read camera image
         auto camera = imread(left_img_paths[frame].string());
         camera_frames.emplace_front(camera);
-        if (camera_frames.size() > num_frames_to_keep) camera_frames.pop_back();
+        if(camera_frames.size() > num_frames_to_keep) camera_frames.pop_back();
 
         // read pose
         auto pose = getClosestFrame(frame, poses);
         pose_frames.push_front(pose);
-        if (pose_frames.size() > num_frames_to_keep) pose_frames.pop_back();
-        cout << "Current pose: " << endl << *pose << endl;
+        if(pose_frames.size() > num_frames_to_keep) pose_frames.pop_back();
+        cerr << "Current pose: " << endl << *pose << endl;
 
         // read lidar
-        auto lidar_path = getClosestFrame(frame, lidar_paths);
-        Cloud::Ptr lidar(new Cloud);
-        io::loadPCDFile<PointXYZ>(lidar_path.string(), *lidar);
-
-        assert(lidar.is_dense);
-        Cloud::Ptr lidar_filtered(new Cloud);
-        for (auto pt : lidar->points) {
-            if (pt.x*pt.x + pt.y*pt.y + pt.z*pt.z < lidar_near_sqr_thresh) continue;
-            lidar_filtered->push_back(pt);
+        Cloud::Ptr lidar_acc(new Cloud);
+        while(lidar_path_it != lidar_paths.end() && lidar_path_it->first < frame) {
+            auto lidar_path = lidar_path_it->second;
+            Cloud::Ptr lidar(new Cloud);
+            io::loadPCDFile<PointXYZ>(lidar_path.string(), *lidar);
+            processLidar(lidar, lidar_path_it->first);
+            *lidar_acc += *lidar;
+            lidar_path_it++;
         }
+        lidar_frames.push_front(lidar_acc);
+        if(lidar_frames.size() > num_frames_to_keep) lidar_frames.pop_back();
+        cerr << lidar_acc->points.size() << " points loaded." << endl;
 
-        lidar_frames.push_front(lidar_filtered);
-        if (lidar_frames.size() > num_frames_to_keep) lidar_frames.pop_back();
-        cout << lidar->points.size() - lidar_filtered->points.size() << " points filtered." << endl;
+        if(lidar_frames.size() < min_lidar_frames_needed) {
+            // not enough lidar data to do anything, just show frame
+            imshow(video, camera);
+        } else {
+          // process frame
+          auto img = processFrame(camera_frames, pose_frames, lidar_frames);
 
-        // process frame
-        auto img = processFrame(camera_frames, pose_frames, lidar_frames);
-        imshow(video, img);
+          // visualize
+          imshow(video, img);
+        }
     }
     cvWaitKey();
     return 0;
