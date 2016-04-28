@@ -51,7 +51,7 @@ const int histogram_size = 30,
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
              ground_distance_thresh = 0.1, // m
-             road_width = 3.0;
+             ground_neighbourhood = 30; // m^2
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -185,10 +185,12 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     cout << pose_z << endl;
     vector<int> histogram(histogram_size, 0);
     for(auto p : in_cloud->points) {
-        if(abs(p.x) < road_width) {
-            int z = round((p.z + pose_z)/ground_distance_thresh) + histogram_offset;
-            if(z >= 0 && z < histogram_size) histogram[z]++;
-        }
+        double x = p.x - (*pose)(0,3),
+               y = p.y - (*pose)(1,3),
+               z = p.z - (*pose)(2,3);
+        if(x*x + y*y + z*z > ground_neighbourhood) continue;
+        int zz = round((p.z - pose_z)/ground_distance_thresh) + histogram_offset;
+        if(zz >= 0 && zz < histogram_size) histogram[zz]++;
     }
     int hist_max = 0, mode = 0;
     for(int i=0; i<histogram_size; i++) {
@@ -200,7 +202,7 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     double ground_height = (mode - histogram_offset) * ground_distance_thresh;
     cout << ground_height << endl;
     for(auto p : in_cloud->points) {
-        if(abs(p.z + pose_z - ground_height) < ground_distance_thresh) {
+        if(abs(p.z - pose_z - ground_height) < ground_distance_thresh) {
             ground_cloud->push_back(p);
         } else {
             stuff_cloud->push_back(p);
@@ -290,13 +292,11 @@ Mat processFrame(const deque<Mat> &camera_frames,
 
     Mat out;
     cvtColor(camera_frames[0], out, COLOR_GRAY2BGR);
-    /*
     vector<int> valid_indices_other;
     auto other_pixels = project(otherstuff, pose, valid_indices_other);
     for (auto pt : other_pixels) {
-        circle(out, pt, 3, Scalar(255, 50, 0), 1, 8, 0);
+        circle(out, pt, 3, Scalar(255, 255, 0), 1, 8, 0);
     }
-    */
     vector<vector<uchar>> ground_colours(ground->size());
     for(int i=camera_frames.size()-1; i>=0; i--) {
         vector<int> valid_indices;
