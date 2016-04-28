@@ -115,7 +115,7 @@ template<typename T> T getClosestFrame(ts frame, map<ts, T> &map) {
     auto ptr = map.upper_bound(frame);
     if(ptr == map.begin()) return ptr->second;
     auto ptr2 = ptr--;
-    if(ptr == map.end()) return ptr->second;
+    if(ptr2 == map.end()) return ptr->second;
     ts d1 = abs(frame - ptr->first);
     ts d2 = abs(frame - ptr2->first);
     return d1 < d2 ? ptr->second : ptr2->second;
@@ -126,7 +126,7 @@ Eigen::Matrix4d T_lidar_global(pose_p pose) {
 }
 
 // Get transform from global frame to image pixel
-vector<Point> project(Cloud::Ptr cloud, const_pose_p pose) {
+vector<Point> project(Cloud::ConstPtr cloud, const_pose_p pose) {
     vector<Point> pixels;
     auto extrinsic = T_vehicle_camera_left.inverse() * pose->inverse();
     for(auto pt : cloud->points) {
@@ -134,7 +134,7 @@ vector<Point> project(Cloud::Ptr cloud, const_pose_p pose) {
         v = extrinsic * v;
         if(v[3] == 0) continue; // point at infinity
         if(v[2] / v[3] < 0) continue; // point behind camera
-        
+
         Eigen::Vector3d pixel = T_projection * v;
         Point p(pixel[0]/pixel[2], pixel[1]/pixel[2]);
         if(p.x < 0 || p.x > 2 * cx || p.y < 0 || p.y > 2 * cy) {
@@ -184,7 +184,7 @@ void processLidar(Cloud::Ptr lidar, ts frame) {
     }
 
     // transform cloud to desired locations
-    auto ptr = poses.upper_bound(frame), 
+    auto ptr = poses.upper_bound(frame),
          ptr2 = poses.lower_bound(frame + lidar_cloud_time);
     if(ptr == poses.begin() || ptr2 == poses.end()) {
         // no need to de-warp at the beginning
