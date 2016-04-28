@@ -1,8 +1,9 @@
 #include <cassert>
-#include <iostream>
-#include <vector>
 #include <fstream>
+#include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem.hpp>
@@ -27,6 +28,7 @@ using namespace cv;
 using namespace pcl;
 using namespace std;
 typedef double ts;
+typedef shared_ptr<Eigen::Matrix4d> pose_p;
 
 /************************* GLOBAL VARIABLES ************************/
 // Data paths
@@ -48,9 +50,15 @@ Eigen::Matrix4d T_vehicle_camera_left {{1,       0,       0, -0.0140},
 const double focal_length = 469.1630, // pixels
                        cx = 508.5,
                        cy = 285.5;
+Eigen::Matrix<double, 3, 4> T_projection {{focal_length, 0, cx, 0},
+                                          {0, focal_length, cy, 0},
+                                          {0, 0,             1, 0}};
 
 // poses
-map<ts, Eigen::Matrix4d> poses;
+map<ts, pose_p> poses;
+
+// thresholds
+const double lidar_near_sqr_thresh = 1;
 /*********************** END GLOBAL VARIABLES **********************/
 
 // string to timestamp
@@ -73,13 +81,13 @@ void loadData() {
     std::ifstream pose_in(pose_path);
     ts t;
     while(pose_in >> t) {
-        Eigen::Matrix4d T;
+        auto T = make_shared<Eigen::Matrix4d>();
         for(int i=0; i<4; i++) {
             for(int j=0; j<4; j++) {
-                pose_in >> T(i,j);
+                pose_in >> (*T)(i,j);
             }
         }
-        poses[t] = T;
+        poses[t] = move(T);
     }
     pose_in.close();
     cout << "Data load success!" << endl;
@@ -91,6 +99,14 @@ template<typename T> T getClosestFrame(ts frame, map<ts, T> &map) {
     ts d1 = abs(frame - ptr->first);
     ts d2 = abs(frame - ptr2->first);
     return d1 < d2 ? ptr->second : ptr2->second;
+}
+// Get transform from lidar frame to global frame
+Eigen::Matrix4d T_lidar_global(pose_p pose) {
+  return *pose * T_vehicle_lidar.inverse();
+}
+// Get transform from global frame to image pixel
+Eigen::Matrix<double, 3, 4> T_global_image(pose_p pose) {
+  return T_projection * T_vehicle_camera_left * pose->inverse();
 }
 int main(int argc, char **argv) {
     loadData();
@@ -123,7 +139,14 @@ int main(int argc, char **argv) {
         pcl::io::loadPCDFile<pcl::PointXYZ> (lidar_path.string(), *lidar);
         cout << lidar->points.size() << " points loaded." << endl;
 
-        cout << "Current pose: " << getClosestFrame(frame, poses) << endl;
+        auto pose = getClosestFrame(frame, poses);
+        cout << "Current pose: " << *pose << endl;
+
+        assert(lidar.is_dense);
+        for (auto pt : lidar->points) {
+          if (pt.x*pt.x + pt.y*pt.y + pt.z*pt.z > lidar_near_sqr_thresh) continue;
+          Eigen::Vector3d pixel = T_global_image(pose) * T_lidar_global(pose) * pt.getVector4fMap().cast<double>();
+        }
     }
     cvWaitKey();
     return 0;
