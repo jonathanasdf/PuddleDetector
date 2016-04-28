@@ -1,5 +1,7 @@
 #include <cassert>
+#include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -114,25 +116,25 @@ int main(int argc, char **argv) {
     char video[] = "video";
     cvNamedWindow(video);
 
-    ts last_frame_time = -1;
+    ts last_frame_timestamp = -1;
+    auto last_frame_time = chrono::high_resolution_clock::now();
     for(auto p : left_img_paths) {
         ts frame = p.first;
         if (!right_img_paths.count(frame)) continue;
 
-        if (last_frame_time != -1) {
-          cvWaitKey((frame - last_frame_time) * 1000);
+        auto current_time = chrono::high_resolution_clock::now();
+        if (last_frame_timestamp != -1) {
+          auto timestamp_diff = frame - last_frame_timestamp;
+          auto time_diff = chrono::duration<double>(current_time - last_frame_time).count();
+          auto wait = max(1., (timestamp_diff - time_diff) * 1000);
+          cvWaitKey(wait);
         }
-        last_frame_time = frame;
-        cout << "Current time: " << frame << endl;
+        last_frame_timestamp = frame;
+        last_frame_time = chrono::high_resolution_clock::now();
+        cout << fixed << "Current frame: " << frame << endl;
 
         auto left = imread(left_img_paths[frame].string());
-        auto right = imread(left_img_paths[frame].string());
-        assert(left.rows == right.rows);
-        assert(left.type() == right.type());
-        Mat combined(left.rows, left.cols + right.cols, left.type());
-        left.copyTo(combined(Rect(0, 0, left.cols, left.rows)));
-        right.copyTo(combined(Rect(left.cols, 0, right.cols, right.rows)));
-        imshow(video, combined);
+        imshow(video, left);
 
         auto lidar_path = getClosestFrame(frame, lidar_paths);
         pcl::PointCloud<pcl::PointXYZ>::Ptr lidar (new pcl::PointCloud<pcl::PointXYZ>);
