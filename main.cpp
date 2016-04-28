@@ -22,7 +22,11 @@
 #include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/extract_indices.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/filters/project_inliers.h>
+#include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/ModelCoefficients.h>
 #include <pcl/point_types.h>
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/sample_consensus/model_types.h>
@@ -43,14 +47,17 @@ typedef PointCloud<PointXYZ> Cloud;
 // Configuration
 const int num_frames_to_keep = 20;
 const int min_lidar_frames_needed = 5;
-const int ransac_iterations = 300;
+const int ransac_iterations = 100;
 const float voxel_size = 0.1; // m or lidar units
 const int histogram_size = 30,
-      histogram_offset = 40;
+          histogram_offset = 40;
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
-             ground_distance_thresh = 0.1, // m
+             furthest_point_y = 15, // m in vehicle frame
+             ground_min_height = -3, // m in vehicle frame
+             ground_max_height = -0.5, // m in vehicle frame
+             ground_distance_thresh = 0.2, // m
              ground_neighbourhood = 30; // m^2
 
 // Data paths
@@ -81,7 +88,6 @@ const ts lidar_cloud_time = 0.1; // seconds or ts units
 const int lidar_num_lasers = 64;
 // poses
 map<ts, pose_p> poses;
-
 /*********************** END GLOBAL VARIABLES **********************/
 
 // string to timestamp
@@ -125,25 +131,19 @@ template<typename T> T getClosestFrame(ts frame, map<ts, T> &map) {
     return d1 < d2 ? ptr->second : ptr2->second;
 }
 // Get transform from lidar frame to global frame
-Eigen::Matrix4d T_lidar_global(pose_p pose) {
+Eigen::Matrix4d T_global_lidar(pose_p pose) {
     return *pose * T_vehicle_lidar;
 }
 
-// Get transform from global frame to image pixel
-vector<Point> project(
-        Cloud::ConstPtr cloud,
-        const_pose_p pose,
-        vector<int> &valid_indices) {
+// Get transform from camera frame to image pixel
+vector<Point> project(Cloud::ConstPtr cloud,
+                      const_pose_p pose,
+                      vector<int> &valid_indices) {
     vector<Point> pixels;
-    auto extrinsic = T_vehicle_camera_left.inverse() * pose->inverse();
+    auto projection = T_projection * T_vehicle_camera_left.inverse();
     for(int i=0; i<cloud->size(); i++) {
         auto pt = cloud->at(i);
-        Eigen::Vector4d v = pt.getVector4fMap().cast<double>();
-        v = extrinsic * v;
-        if(v[3] == 0) continue; // point at infinity
-        if(v[2] / v[3] < 0) continue; // point behind camera
-
-        Eigen::Vector3d pixel = T_projection * v;
+        Eigen::Vector3d pixel = projection * pt.getVector4fMap().cast<double>();
         Point p(pixel[0]/pixel[2], pixel[1]/pixel[2]);
         if(p.x < 0 || p.x > 2 * cx || p.y < 0 || p.y > 2 * cy) {
             // outside of frame
@@ -158,7 +158,24 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
                     const_pose_p pose,
                     Cloud::Ptr ground_cloud,
                     Cloud::Ptr stuff_cloud) {
-    /*
+    vector<int> filtered;
+    PassThrough<PointXYZ> pass;
+    pass.setInputCloud(in_cloud);
+    pass.setFilterFieldName("z");
+    pass.setFilterLimits(ground_min_height, ground_max_height);
+    pass.filter(filtered);
+
+    // extract unfiltered indices into stuff_cloud
+    Cloud::Ptr ground_in(new Cloud);
+    ExtractIndices<PointXYZ> extract;
+    extract.setInputCloud(in_cloud);
+    extract.setIndices(boost::make_shared<vector<int>>(filtered));
+    extract.setNegative(false);
+    extract.filter(*ground_in);
+    extract.setNegative(true);
+    extract.filter(*stuff_cloud);
+
+
     ModelCoefficients coefficients;
     PointIndices::Ptr inliers(new PointIndices);
     // segment it!
@@ -168,23 +185,33 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     seg.setMethodType(SAC_RANSAC);
     seg.setDistanceThreshold(ground_distance_thresh);
     seg.setMaxIterations(ransac_iterations);
-    seg.setInputCloud(in_cloud);
+    seg.setInputCloud(ground_in);
     seg.segment(*inliers, coefficients);
     cout << coefficients << endl;
 
     // extract the plane into a new point cloud
-    ExtractIndices<PointXYZ> extract;
-    extract.setInputCloud(in_cloud);
-    extract.setIndices(inliers);
-    extract.setNegative(false);
-    extract.filter(*ground_cloud);
-    extract.setNegative(true);
-    extract.filter(*stuff_cloud);
-    */
+    Cloud::Ptr ground_plane(new Cloud);
+    Cloud::Ptr tmp(new Cloud);
+    ExtractIndices<PointXYZ> extract2;
+    extract2.setInputCloud(ground_in);
+    extract2.setIndices(inliers);
+    extract2.setNegative(false);
+    extract2.filter(*ground_plane);
+    extract2.setNegative(true);
+    extract2.filter(*tmp);
+    *stuff_cloud += *tmp;
+
+    // project the ground inliers
+    ProjectInliers<PointXYZ> proj;
+    proj.setModelType(SACMODEL_PLANE);
+    proj.setInputCloud(ground_plane);
+    proj.setModelCoefficients(boost::make_shared<ModelCoefficients>(coefficients));
+    proj.filter(*ground_cloud);
+/*
     double pose_z = (*pose)(2,3);
     cout << pose_z << endl;
     vector<int> histogram(histogram_size, 0);
-    for(auto p : in_cloud->points) {
+    for(auto p : tmp->points) {
         double x = p.x - (*pose)(0,3),
                y = p.y - (*pose)(1,3),
                z = p.z - (*pose)(2,3);
@@ -201,13 +228,14 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     }
     double ground_height = (mode - histogram_offset) * ground_distance_thresh;
     cout << ground_height << endl;
-    for(auto p : in_cloud->points) {
+    for(auto p : tmp->points) {
         if(abs(p.z - pose_z - ground_height) < ground_distance_thresh) {
             ground_cloud->push_back(p);
         } else {
             stuff_cloud->push_back(p);
         }
     }
+*/
 }
 // Clean and transform lidar cloud into global frame with dewarp
 void processLidar(Cloud::Ptr lidar, ts frame) {
@@ -235,15 +263,15 @@ void processLidar(Cloud::Ptr lidar, ts frame) {
     if(ptr == poses.begin() || ptr2 == poses.end()) {
         // no need to de-warp at the beginning
         if(ptr == poses.end()) ptr--;
-        transformPointCloud(*lidar, ind->indices, *temp_cloud, T_lidar_global(ptr->second));
-        lidar->swap(*temp_cloud);
+        transformPointCloud(*lidar, ind->indices, *temp_cloud, T_global_lidar(ptr->second));
+        lidar.swap(temp_cloud);
         return;
     }
     Cloud::Ptr temp_cloud2(new Cloud);
     ptr--;
     auto t1 = ptr->first, t2 = ptr2->first;
-    auto T1 = T_lidar_global(ptr->second),
-         T2 = T_lidar_global(ptr2->second);
+    auto T1 = T_global_lidar(ptr->second),
+         T2 = T_global_lidar(ptr2->second);
     assert(t1 <= frame && t2 > frame);
     transformPointCloud(*lidar, ind->indices, *temp_cloud, T1);
     transformPointCloud(*lidar, ind->indices, *temp_cloud2, T2);
@@ -277,25 +305,31 @@ Mat processFrame(const deque<Mat> &camera_frames,
 
     auto pose = pose_frames[0];
 
+    // Transform point to current frame
+    lidar_aggregation.swap(lidar_filtered);
+    lidar_filtered->clear();
+    auto T = pose->inverse();
+    for(int i=0; i<lidar_aggregation->size(); i++) {
+        auto pt = lidar_aggregation->at(i);
+        Eigen::Vector4d v = T * pt.getVector4fMap().cast<double>();
+        if(v[3] == 0) continue; // point at infinity
+        if(v[1] / v[3] < 0) continue; // point behind camera
+        if(v[1] / v[3] > furthest_point_y) continue; // point too far ahead
+        pt.x = v[0] / v[3];
+        pt.y = v[1] / v[3];
+        pt.z = v[2] / v[3];
+        lidar_filtered->push_back(pt);
+    }
+
     Cloud::Ptr ground(new Cloud), otherstuff(new Cloud);
     getGroundPlane(lidar_filtered, pose, ground, otherstuff);
-
-    /*
-    vector<Point> pixels, hull;
-    for(auto pt : ground->points) {
-        Eigen::Vector3d pixel_hom = T_global_image(pose) * pt.getVector4fMap().cast<double>();
-        Point2d pixel(pixel_hom[0]/pixel_hom[2], pixel_hom[1]/pixel_hom[2]);
-        pixels.push_back(pixel);
-    }
-    convexHull(pixels, hull);
-    */
 
     Mat out;
     cvtColor(camera_frames[0], out, COLOR_GRAY2BGR);
     vector<int> valid_indices_other;
     auto other_pixels = project(otherstuff, pose, valid_indices_other);
-    for (auto pt : other_pixels) {
-        circle(out, pt, 3, Scalar(255, 255, 0), 1, 8, 0);
+    for (int i=0; i<other_pixels.size(); i++) {
+        circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
     }
     vector<vector<uchar>> ground_colours(ground->size());
     for(int i=camera_frames.size()-1; i>=0; i--) {
@@ -317,17 +351,6 @@ Mat processFrame(const deque<Mat> &camera_frames,
             }
         }
     }
-
-    //for(int j=0; j < out.rows; j++) {
-    //    for(int i=0; i < out.cols; i++) {
-    //        if(pointPolygonTest(hull, Point2d(i, j), false) >= 0) {
-    //            auto &color = out.at<Vec3b>(j, i);
-    //            color[0] = 255;
-    //            color[1] = 0;
-    //            color[2] = 0;
-    //        }
-    //    }
-    //}
     return out;
 }
 
@@ -370,7 +393,6 @@ int main(int argc, char **argv) {
         cerr << "Current pose: " << endl << *pose << endl;
 
         // read lidar
-        Cloud::Ptr lidar_acc(new Cloud);
         while(lidar_path_it != lidar_paths.end() && lidar_path_it->first < frame) {
             auto lidar_path = lidar_path_it->second;
             Cloud::Ptr lidar(new Cloud);
@@ -380,10 +402,6 @@ int main(int argc, char **argv) {
             while(lidar_frames.size() > min_lidar_frames_needed) lidar_frames.pop_back();
             lidar_path_it++;
         }
-        for(auto lidar : lidar_frames) {
-            *lidar_acc += *lidar;
-        }
-        cerr << lidar_acc->points.size() << " points loaded." << endl;
 
         if(lidar_frames.size() < min_lidar_frames_needed) {
             // not enough lidar data to do anything, just show frame
@@ -391,7 +409,6 @@ int main(int argc, char **argv) {
         } else {
             // process frame
             auto img = processFrame(camera_frames, pose_frames, lidar_frames);
-
             imshow(video, img);
         }
     }
