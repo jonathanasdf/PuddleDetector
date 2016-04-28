@@ -7,7 +7,7 @@ quaternions_xyzw = poses(:, 9:12);
 
 T1 = inv([quat2rotm(quaternions_xyzw(1, :)) translations(1, :)'; 0 0 0 1]);
 T = [];
-for i = 1:size(times)
+for i = 1:size(timestamps)
     T = [T; timestamps(i) reshape((T1 * [quat2rotm(quaternions_xyzw(i, :)) translations(i, :)'; 0 0 0 1])', 1, [])];
 end
 dlmwrite('../data/odom_clean.dat', T, 'delimiter', ' ', 'precision', 20);
