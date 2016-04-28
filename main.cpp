@@ -33,6 +33,7 @@ using namespace cv;
 using namespace pcl;
 using namespace std;
 typedef double ts;
+typedef PointCloud<PointXYZ> Cloud;
 typedef shared_ptr<Eigen::Matrix4d> pose_p;
 typedef shared_ptr<const Eigen::Matrix4d> const_pose_p;
 
@@ -112,38 +113,61 @@ template<typename T> T getClosestFrame(ts frame, map<ts, T> &map) {
     return d1 < d2 ? ptr->second : ptr2->second;
 }
 // Get transform from lidar frame to global frame
-Eigen::Matrix4d T_lidar_global(pose_p pose) {
+Eigen::Matrix4d T_lidar_global(const_pose_p pose) {
     return *pose * T_vehicle_lidar.inverse();
 }
 // Get transform from global frame to image pixel
-Eigen::Matrix<double, 3, 4> T_global_image(pose_p pose) {
+Eigen::Matrix<double, 3, 4> T_global_image(const_pose_p pose) {
     return T_projection * T_vehicle_camera_left * pose->inverse();
+}
+void getGroundPlane(Cloud::ConstPtr in_cloud,
+                    Cloud::Ptr ground_cloud,
+                    Cloud::Ptr stuff_cloud) {
+   ModelCoefficients coefficients;
+   PointIndices::Ptr inliers(new PointIndices);
+   // segment it!
+   SACSegmentation<PointXYZ> seg;
+   seg.setOptimizeCoefficients(true);
+   seg.setModelType(SACMODEL_PLANE);
+   seg.setMethodType(SAC_RANSAC);
+   seg.setDistanceThreshold(ground_distance_thresh);
+   seg.setInputCloud(in_cloud);
+   seg.segment(*inliers, coefficients);
+
+   // extract the plane into a new point cloud
+   ExtractIndices<PointXYZ> extract;
+   extract.setInputCloud(in_cloud);
+   extract.setIndices(inliers);
+   extract.setNegative(false);
+   extract.filter(*ground_cloud);
+   extract.setNegative(true);
+   extract.filter(*stuff_cloud);
 }
 Mat processFrame(const deque<Mat> &camera_frames,
                  const deque<const_pose_p> &pose_frames,
-                 const deque<PointCloud<PointXYZ>::ConstPtr> &lidar_frames) {
+                 const deque<Cloud::ConstPtr> &lidar_frames) {
     Mat out(camera_frames[0]);
+    Cloud::Ptr ground(new Cloud), stuff(new Cloud);
+    getGroundPlane(lidar_frames[0], ground, stuff);
+    vector<Point> pixels, hull;
+    for (auto pt : ground->points) {
+        auto pose = pose_frames[0];
+        Eigen::Vector3d pixel_hom = T_global_image(pose) * T_lidar_global(pose) * pt.getVector4fMap().cast<double>();
+        Point2d pixel(pixel_hom(0)/pixel_hom(2), pixel_hom(1)/pixel_hom(2));
+        pixels.push_back(pixel);
+    }
+    convexHull(pixels, hull);
+    for (int j=0; j < out.rows; j++) {
+        for (int i=0; i < out.cols; i++) {
+            if (pointPolygonTest(hull, Point2d(i, j), false) >= 0) {
+                auto &color = out.at<Vec3b>(j, i);
+                color[0] = 255;
+                color[1] = 0;
+                color[2] = 0;
+            }
+        }
+    }
     return out;
-}
-
-void getGroundPlane(PointCloud<PointXYZ>::Ptr in_cloud, PointCloud<PointXYZ>::Ptr out_cloud) {
-    ModelCoefficients coefficients;
-    PointIndices::Ptr inliers(new PointIndices());
-    // segment it!
-    SACSegmentation<PointXYZ> seg;
-    seg.setOptimizeCoefficients(true);
-    seg.setModelType(SACMODEL_PLANE);
-    seg.setMethodType(SAC_RANSAC);
-    seg.setDistanceThreshold(ground_distance_thresh);
-    seg.setInputCloud(in_cloud);
-    seg.segment(*inliers, coefficients);
-
-    // extract the plane into a new point cloud
-    ExtractIndices<PointXYZ> extract;
-    extract.setInputCloud(in_cloud);
-    extract.setIndices(inliers);
-    extract.setNegative(false);
-    extract.filter(*out_cloud);
 }
 
 int main(int argc, char **argv) {
@@ -154,7 +178,7 @@ int main(int argc, char **argv) {
 
     deque<Mat> camera_frames;
     deque<const_pose_p> pose_frames;
-    deque<PointCloud<PointXYZ>::ConstPtr> lidar_frames;
+    deque<Cloud::ConstPtr> lidar_frames;
 
     ts last_frame_timestamp = -1;
     auto last_frame_time = chrono::high_resolution_clock::now();
@@ -181,21 +205,23 @@ int main(int argc, char **argv) {
         auto pose = getClosestFrame(frame, poses);
         pose_frames.push_front(pose);
         if (pose_frames.size() > num_frames_to_keep) pose_frames.pop_back();
-        cout << "Current pose: " << *pose << endl;
+        cout << "Current pose: " << endl << *pose << endl;
 
         // read lidar
         auto lidar_path = getClosestFrame(frame, lidar_paths);
-        PointCloud<PointXYZ>::Ptr lidar(new PointCloud<PointXYZ>);
+        Cloud::Ptr lidar(new Cloud);
         io::loadPCDFile<PointXYZ>(lidar_path.string(), *lidar);
-        lidar_frames.push_front(lidar);
-        if (lidar_frames.size() > num_frames_to_keep) lidar_frames.pop_back();
-        cout << lidar->points.size() << " points loaded." << endl;
 
         assert(lidar.is_dense);
+        Cloud::Ptr lidar_filtered(new Cloud);
         for (auto pt : lidar->points) {
-            if (pt.x*pt.x + pt.y*pt.y + pt.z*pt.z > lidar_near_sqr_thresh) continue;
-            Eigen::Vector3d pixel = T_global_image(pose) * T_lidar_global(pose) * pt.getVector4fMap().cast<double>();
+            if (pt.x*pt.x + pt.y*pt.y + pt.z*pt.z < lidar_near_sqr_thresh) continue;
+            lidar_filtered->push_back(pt);
         }
+
+        lidar_frames.push_front(lidar_filtered);
+        if (lidar_frames.size() > num_frames_to_keep) lidar_frames.pop_back();
+        cout << lidar->points.size() - lidar_filtered->points.size() << " points filtered." << endl;
 
         // process frame
         auto img = processFrame(camera_frames, pose_frames, lidar_frames);
