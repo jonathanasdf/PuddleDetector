@@ -20,7 +20,7 @@
 #include <opencv2/imgproc/imgproc.hpp>
 
 #include <pcl/common/transforms.h>
-#include <pcl/filters/approximate_voxel_grid.h>
+#include <pcl/filters/voxel_grid.h>
 #include <pcl/filters/extract_indices.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
@@ -43,11 +43,12 @@ typedef PointCloud<PointXYZ> Cloud;
 // Configuration
 const int num_frames_to_keep = 10;
 const int min_lidar_frames_needed = 3;
+const int ransac_iterations = 300;
 const float voxel_size = 0.1; // m or lidar units
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
-             ground_distance_thresh = 0.2; // m
+             ground_distance_thresh = 0.25; // m
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -126,10 +127,14 @@ Eigen::Matrix4d T_lidar_global(pose_p pose) {
 }
 
 // Get transform from global frame to image pixel
-vector<Point> project(Cloud::ConstPtr cloud, const_pose_p pose) {
+vector<Point> project(
+        Cloud::ConstPtr cloud,
+        const_pose_p pose,
+        vector<int> &valid_indices) {
     vector<Point> pixels;
     auto extrinsic = T_vehicle_camera_left.inverse() * pose->inverse();
-    for(auto pt : cloud->points) {
+    for(int i=0; i<cloud->size(); i++) {
+        auto pt = cloud->at(i);
         Eigen::Vector4d v = pt.getVector4fMap().cast<double>();
         v = extrinsic * v;
         if(v[3] == 0) continue; // point at infinity
@@ -141,6 +146,7 @@ vector<Point> project(Cloud::ConstPtr cloud, const_pose_p pose) {
             // outside of frame
             continue;
         }
+        valid_indices.push_back(i);
         pixels.push_back(p);
     }
     return pixels;
@@ -156,8 +162,10 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
    seg.setModelType(SACMODEL_PLANE);
    seg.setMethodType(SAC_RANSAC);
    seg.setDistanceThreshold(ground_distance_thresh);
+   seg.setMaxIterations(ransac_iterations);
    seg.setInputCloud(in_cloud);
    seg.segment(*inliers, coefficients);
+   cout << coefficients << endl;
 
    // extract the plane into a new point cloud
    ExtractIndices<PointXYZ> extract;
@@ -170,13 +178,17 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
 }
 // Clean and transform lidar cloud into global frame with dewarp
 void processLidar(Cloud::Ptr lidar, ts frame) {
+    Cloud::Ptr lidar_unfiltered(new Cloud(*lidar));
+    VoxelGrid<PointXYZ> voxels;
+    voxels.setInputCloud(lidar_unfiltered);
+    voxels.setLeafSize(voxel_size, voxel_size, voxel_size);
+    voxels.filter(*lidar);
     // filter out bad points
     PointIndices::Ptr ind(new PointIndices);
     Cloud::Ptr temp_cloud(new Cloud);
     int n = lidar->size();
     for(int i=0; i<n; i++) {
         auto pt = lidar->at(i);
-        if(pt.x < 0) continue; // remove points behind vehicle
         if(pt.x*pt.x + pt.y*pt.y + pt.z*pt.z < lidar_near_sqr_thresh) {
             continue;
         }
@@ -224,7 +236,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
     }
 
     Cloud::Ptr lidar_filtered(new Cloud);
-    ApproximateVoxelGrid<PointXYZ> voxels;
+    VoxelGrid<PointXYZ> voxels;
     voxels.setInputCloud(lidar_aggregation);
     voxels.setLeafSize(voxel_size, voxel_size, voxel_size);
     voxels.filter(*lidar_filtered);
@@ -244,14 +256,35 @@ Mat processFrame(const deque<Mat> &camera_frames,
     */
 
     Mat out(camera_frames[0]);
-    auto ground_pixels = project(ground, pose);
-    for (auto pt : ground_pixels) {
-        circle(out, pt, 3, Scalar(0, 50, 200), 1, 8, 0);
-    }
-    auto other_pixels = project(otherstuff, pose);
+    /*
+    vector<int> valid_indices_other;
+    auto other_pixels = project(otherstuff, pose, valid_indices_other);
     for (auto pt : other_pixels) {
         circle(out, pt, 3, Scalar(255, 50, 0), 1, 8, 0);
     }
+    */
+    vector<vector<double>> ground_colours(ground->size());
+    for(int i=camera_frames.size()-1; i>=0; i--) {
+        vector<int> valid_indices;
+        auto ground_pixels = project(ground, pose, valid_indices);
+        for(int j=0; j<valid_indices.size(); j++) {
+            ground_colours[valid_indices[j]].push_back(
+                    camera_frames[i].at<Vec3f>(ground_pixels[j])[0]
+                    );
+        }
+        if(i==0) {
+            for(int i=0; i<ground_pixels.size(); i++) {
+                int min_colour = 255, max_colour = 0;
+                for(auto c : ground_colours[i]) {
+                    if(c < min_colour) min_colour = c;
+                    if(c > max_colour) max_colour = c;
+                }
+                int q = max(0, max_colour - min_colour);
+                circle(out, ground_pixels[i], 3, Scalar(q, 50, 255 - q), 1, 8, 0);
+            }
+        }
+    }
+
     //for(int j=0; j < out.rows; j++) {
     //    for(int i=0; i < out.cols; i++) {
     //        if(pointPolygonTest(hull, Point2d(i, j), false) >= 0) {
@@ -310,11 +343,13 @@ int main(int argc, char **argv) {
             Cloud::Ptr lidar(new Cloud);
             io::loadPCDFile<PointXYZ>(lidar_path.string(), *lidar);
             processLidar(lidar, lidar_path_it->first);
-            *lidar_acc += *lidar;
+            lidar_frames.push_front(lidar);
+            while(lidar_frames.size() > min_lidar_frames_needed) lidar_frames.pop_back();
             lidar_path_it++;
         }
-        lidar_frames.push_front(lidar_acc);
-        while(lidar_frames.size() > num_frames_to_keep) lidar_frames.pop_back();
+        for(auto lidar : lidar_frames) {
+            *lidar_acc += *lidar;
+        }
         cerr << lidar_acc->points.size() << " points loaded." << endl;
 
         if(lidar_frames.size() < min_lidar_frames_needed) {
