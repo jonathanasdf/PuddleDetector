@@ -48,7 +48,7 @@ const float voxel_size = 0.1; // m or lidar units
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
-             ground_distance_thresh = 0.25; // m
+             ground_distance_thresh = 0.5; // m
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -255,7 +255,8 @@ Mat processFrame(const deque<Mat> &camera_frames,
     convexHull(pixels, hull);
     */
 
-    Mat out(camera_frames[0]);
+    Mat out;
+    cvtColor(camera_frames[0], out, COLOR_GRAY2BGR);
     /*
     vector<int> valid_indices_other;
     auto other_pixels = project(otherstuff, pose, valid_indices_other);
@@ -263,23 +264,22 @@ Mat processFrame(const deque<Mat> &camera_frames,
         circle(out, pt, 3, Scalar(255, 50, 0), 1, 8, 0);
     }
     */
-    vector<vector<double>> ground_colours(ground->size());
+    vector<vector<uchar>> ground_colours(ground->size());
     for(int i=camera_frames.size()-1; i>=0; i--) {
         vector<int> valid_indices;
-        auto ground_pixels = project(ground, pose, valid_indices);
+        auto ground_pixels = project(ground, pose_frames[i], valid_indices);
         for(int j=0; j<valid_indices.size(); j++) {
-            ground_colours[valid_indices[j]].push_back(
-                    camera_frames[i].at<Vec3f>(ground_pixels[j])[0]
-                    );
+            auto colour = camera_frames[i].at<uchar>(ground_pixels[j]);
+            ground_colours[valid_indices[j]].push_back(colour);
         }
         if(i==0) {
             for(int i=0; i<ground_pixels.size(); i++) {
-                int min_colour = 255, max_colour = 0;
+                uchar min_colour = 255, max_colour = 0;
                 for(auto c : ground_colours[i]) {
                     if(c < min_colour) min_colour = c;
                     if(c > max_colour) max_colour = c;
                 }
-                int q = max(0, max_colour - min_colour);
+                uchar q = max(0, max_colour - min_colour);
                 circle(out, ground_pixels[i], 3, Scalar(q, 50, 255 - q), 1, 8, 0);
             }
         }
@@ -326,7 +326,7 @@ int main(int argc, char **argv) {
         cerr << fixed << "Current frame: " << frame << endl;
 
         // read camera image
-        auto camera = imread(left_img_paths[frame].string());
+        auto camera = imread(left_img_paths[frame].string(), 0);
         camera_frames.emplace_front(camera);
         if(camera_frames.size() > num_frames_to_keep) camera_frames.pop_back();
 
