@@ -314,7 +314,7 @@ int main(int argc, char **argv) {
             lidar_path_it++;
         }
         lidar_frames.push_front(lidar_acc);
-        if(lidar_frames.size() > num_frames_to_keep) lidar_frames.pop_back();
+        while(lidar_frames.size() > num_frames_to_keep) lidar_frames.pop_back();
         cerr << lidar_acc->points.size() << " points loaded." << endl;
 
         if(lidar_frames.size() < min_lidar_frames_needed) {
