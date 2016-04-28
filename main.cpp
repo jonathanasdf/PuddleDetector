@@ -40,12 +40,12 @@ typedef PointCloud<PointXYZ> Cloud;
 
 /************************* GLOBAL VARIABLES ************************/
 // Configuration
-const int num_frames_to_keep = 10;
+const int num_frames_to_keep = 1;
 const double voxel_size = 0.1; // m or lidar units
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
-             ground_distance_thresh = 0.1; // m
+             ground_distance_thresh = 0.3; // m
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -120,12 +120,24 @@ template<typename T> T getClosestFrame(ts frame, map<ts, T> &map) {
 }
 // Get transform from lidar frame to global frame
 Eigen::Matrix4d T_lidar_global(pose_p pose) {
-    return *pose * T_vehicle_lidar.inverse();
+    return *pose * T_vehicle_lidar;
 }
 
 // Get transform from global frame to image pixel
-Eigen::Matrix<double, 3, 4> T_global_image(pose_p pose) {
-    return T_projection * T_vehicle_camera_left * pose->inverse();
+vector<Point> project(Cloud::Ptr cloud, pose_p pose) {
+    vector<Point> pixels;
+    auto extrinsic = T_vehicle_camera_left.inverse() * pose->inverse();
+    for(auto pt : cloud->points) {
+        Eigen::Vector4d v = pt.getVector4fMap().cast<double>();
+        v = extrinsic * v;
+        if(v[3] == 0) continue; // point at infinity
+        if(v[2] / v[3] < 0) continue; // point behind camera
+        if(v[0] / v[3] < 0 || v[0] / v[3] > 2 * cx) continue; // out of frame
+        if(v[1] / v[3] < 0 || v[1] / v[3] > 2 * cy) continue;
+        
+        Eigen::Vector3d pixel = T_projection * v;
+        pixels.push_back(Point(pixel[0]/pixel[2], pixel[1]/pixel[2]));
+    }
 }
 
 void getGroundPlane(
@@ -166,18 +178,23 @@ void processLidar(Cloud::Ptr lidar, ts frame) {
     for(int i=0; i<n; i++) {
         auto pt = lidar->at(i);
         if(pt.x < 0) continue; // remove points behind vehicle
-        if(pt.x*pt.x + pt.y*pt.y + pt.z*pt.z < lidar_near_sqr_thresh) continue;
+        if(pt.x*pt.x + pt.y*pt.y + pt.z*pt.z < lidar_near_sqr_thresh) {
+            cerr << "c";
+            continue;
+        }
         ind->indices.push_back(i);
     }
 
     // transform cloud to desired locations
-    auto ptr = poses.upper_bound(frame), ptr2 = ptr;
-    if(ptr == poses.begin() || ptr == poses.end()) {
+    auto ptr = poses.upper_bound(frame), 
+         ptr2 = poses.lower_bound(frame + lidar_cloud_time);
+    if(ptr == poses.begin() || ptr2 == poses.end()) {
         // no need to de-warp at the beginning
         if(ptr == poses.end()) ptr--;
-        transformPointCloud(*lidar, ind->indices, *lidar, T_lidar_global(ptr->second));
+        transformPointCloud(*lidar, ind->indices, *temp_cloud, T_lidar_global(ptr->second));
+        lidar->swap(*temp_cloud);
 
-        cerr << "lidar processed (begin or end)" << endl;
+        cerr << " lidar processed (begin or end)" << endl;
         return;
     }
     cerr << "dewarping... ";
@@ -211,6 +228,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
     Mat out(camera_frames[0]);
     return out;
 }
+
 
 int main(int argc, char **argv) {
     loadData();
@@ -276,13 +294,11 @@ int main(int argc, char **argv) {
 
         assert(lidar_aggregation.is_dense);
 
-        /*
-        Cloud::Ptr lidar_filtered;
-        ApproximateVoxelGrid<Cloud> voxels;
+        Cloud::Ptr lidar_filtered(new Cloud);
+        ApproximateVoxelGrid<PointXYZ> voxels;
         voxels.setInputCloud(lidar_aggregation);
         voxels.setLeafSize(voxel_size);
         voxels.filter(*lidar_filtered);
-        */
 
         Cloud::Ptr ground(new Cloud);
         Cloud::Ptr otherstuff(new Cloud);
@@ -291,20 +307,12 @@ int main(int argc, char **argv) {
         // process frame
         auto img = processFrame(camera_frames, pose_frames, lidar_frames);
 
-        for (auto pt : ground->points) {
-            Eigen::Vector3d pixel = T_global_image(pose) * pt.getVector4fMap().cast<double>();
-            // draw 
-            Point cvpt;
-            cvpt.x = pixel[0]/pixel[2];
-            cvpt.y = pixel[1]/pixel[2];
-            circle(img, cvpt, 3, Scalar(0, 50, 200), 1, 8, 0);
+        vector<Point> ground_pixels = project(ground, pose);
+        vector<Point> other_pixels = project(otherstuff, pose);
+        for (auto cvpt : ground_pixels) {
+            circle(img, cvpt, 3, Scalar(0, 100, 200), 1, 8, 0);
         }
-        for (auto pt : otherstuff->points) {
-            Eigen::Vector3d pixel = T_global_image(pose) * pt.getVector4fMap().cast<double>();
-            // draw 
-            Point cvpt;
-            cvpt.x = pixel[0]/pixel[2];
-            cvpt.y = pixel[1]/pixel[2];
+        for (auto cvpt : other_pixels) {
             circle(img, cvpt, 3, Scalar(255, 50, 0), 1, 8, 0);
         }
 
