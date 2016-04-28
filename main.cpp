@@ -43,7 +43,7 @@ typedef PointCloud<PointXYZ> Cloud;
 // Configuration
 const int num_frames_to_keep = 10;
 const int min_lidar_frames_needed = 5;
-const double voxel_size = 0.1; // m or lidar units
+const float voxel_size = 0.1; // m or lidar units
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
@@ -205,54 +205,47 @@ Mat processFrame(const deque<Mat> &camera_frames,
         *lidar_aggregation += *lidar;
     }
 
-    /*
-    Cloud::Ptr lidar_filtered;
-    ApproximateVoxelGrid<Cloud> voxels;
+    Cloud::Ptr lidar_filtered(new Cloud);
+    ApproximateVoxelGrid<PointXYZ> voxels;
     voxels.setInputCloud(lidar_aggregation);
-    voxels.setLeafSize(voxel_size);
+    voxels.setLeafSize(voxel_size, voxel_size, voxel_size);
     voxels.filter(*lidar_filtered);
-    */
 
     Cloud::Ptr ground(new Cloud), otherstuff(new Cloud);
-    getGroundPlane(lidar_aggregation, ground, otherstuff);
+    getGroundPlane(lidar_filtered, ground, otherstuff);
 
     auto pose = pose_frames[0];
     vector<Point> pixels, hull;
     for(auto pt : ground->points) {
         Eigen::Vector3d pixel_hom = T_global_image(pose) * pt.getVector4fMap().cast<double>();
-        Point2d pixel(pixel_hom(0)/pixel_hom(2), pixel_hom(1)/pixel_hom(2));
+        Point2d pixel(pixel_hom[0]/pixel_hom[2], pixel_hom[1]/pixel_hom[2]);
         pixels.push_back(pixel);
     }
     convexHull(pixels, hull);
 
     Mat out(camera_frames[0]);
     for (auto pt : ground->points) {
-        Eigen::Vector3d pixel = T_global_image(pose) * pt.getVector4fMap().cast<double>();
+        Eigen::Vector3d pixel_hom = T_global_image(pose) * pt.getVector4fMap().cast<double>();
         // draw
-        Point cvpt;
-        cvpt.x = pixel[0]/pixel[2];
-        cvpt.y = pixel[1]/pixel[2];
-        circle(out, cvpt, 3, Scalar(0, 50, 200), 1, 8, 0);
+        Point2d pixel(pixel_hom[0]/pixel_hom[2], pixel_hom[1]/pixel_hom[2]);
+        circle(out, pixel, 3, Scalar(0, 50, 200), 1, 8, 0);
     }
     for (auto pt : otherstuff->points) {
-        Eigen::Vector3d pixel = T_global_image(pose) * pt.getVector4fMap().cast<double>();
+        Eigen::Vector3d pixel_hom = T_global_image(pose) * pt.getVector4fMap().cast<double>();
         // draw
-        Point cvpt;
-        cvpt.x = pixel[0]/pixel[2];
-        cvpt.y = pixel[1]/pixel[2];
-        circle(out, cvpt, 3, Scalar(255, 50, 0), 1, 8, 0);
+        Point2d pixel(pixel_hom[0]/pixel_hom[2], pixel_hom[1]/pixel_hom[2]);
+        circle(out, pixel, 3, Scalar(255, 50, 0), 1, 8, 0);
     }
-
-    for(int j=0; j < out.rows; j++) {
-        for(int i=0; i < out.cols; i++) {
-            if(pointPolygonTest(hull, Point2d(i, j), false) >= 0) {
-                auto &color = out.at<Vec3b>(j, i);
-                color[0] = 255;
-                color[1] = 0;
-                color[2] = 0;
-            }
-        }
-    }
+    //for(int j=0; j < out.rows; j++) {
+    //    for(int i=0; i < out.cols; i++) {
+    //        if(pointPolygonTest(hull, Point2d(i, j), false) >= 0) {
+    //            auto &color = out.at<Vec3b>(j, i);
+    //            color[0] = 255;
+    //            color[1] = 0;
+    //            color[2] = 0;
+    //        }
+    //    }
+    //}
     return out;
 }
 int main(int argc, char **argv) {
