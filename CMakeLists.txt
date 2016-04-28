@@ -6,7 +6,7 @@ set(CMAKE_CXX_FLAGS "-O3 -Wno-deprecated-declarations")
 include_directories(${PROJECT_SOURCE_DIR})
 
 find_package(PCL 1.8 REQUIRED)
-find_package(OpenCV 2.4 REQUIRED)
+find_package(OpenCV REQUIRED)
 find_package(Boost REQUIRED)
 
 include_directories(${PCL_INCLUDE_DIRS})

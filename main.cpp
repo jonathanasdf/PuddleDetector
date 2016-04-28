@@ -26,6 +26,7 @@
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/sample_consensus/model_types.h>
 #include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/filters/extract_indices.h>
 
 using namespace boost::filesystem;
 using namespace cv;
@@ -40,7 +41,8 @@ typedef shared_ptr<const Eigen::Matrix4d> const_pose_p;
 const int num_frames_to_keep = 10;
 
 // thresholds
-const double lidar_near_sqr_thresh = 1;
+const double lidar_near_sqr_thresh = 1,
+             ground_distance_thresh = 0.1;
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -68,9 +70,6 @@ Eigen::Matrix<double, 3, 4> T_projection {{focal_length, 0, cx, 0},
 // poses
 map<ts, pose_p> poses;
 
-// thresholds
-const double lidar_near_sqr_thresh = 1,
-             ground_distance_thresh = 0.1;
 /*********************** END GLOBAL VARIABLES **********************/
 
 // string to timestamp
@@ -129,7 +128,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
 
 void getGroundPlane(PointCloud<PointXYZ>::Ptr in_cloud, PointCloud<PointXYZ>::Ptr out_cloud) {
     ModelCoefficients coefficients;
-    PointIndices inliers;
+    PointIndices::Ptr inliers(new PointIndices());
     // segment it!
     SACSegmentation<PointXYZ> seg;
     seg.setOptimizeCoefficients(true);
@@ -137,10 +136,10 @@ void getGroundPlane(PointCloud<PointXYZ>::Ptr in_cloud, PointCloud<PointXYZ>::Pt
     seg.setMethodType(SAC_RANSAC);
     seg.setDistanceThreshold(ground_distance_thresh);
     seg.setInputCloud(in_cloud);
-    seg.segment(inliers, coefficients);
+    seg.segment(*inliers, coefficients);
 
     // extract the plane into a new point cloud
-    ExtractIndices extract;
+    ExtractIndices<PointXYZ> extract;
     extract.setInputCloud(in_cloud);
     extract.setIndices(inliers);
     extract.setNegative(false);
