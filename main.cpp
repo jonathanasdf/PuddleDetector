@@ -53,7 +53,7 @@ bool operator<(const Point a, const Point b) { return (a.x < b.x) || (a.x == b.x
 const double PI = 3.1415926535897932384626433832795028;
 // Configuration
 const int num_frames_to_keep = 20;
-const int min_lidar_frames_needed = 10;
+const int min_lidar_frames_needed = 5;
 const int ransac_iterations = 100;
 const float voxel_size = 0.1; // m or lidar units
 const int histogram_size = 40,
@@ -65,7 +65,7 @@ const int pixel_bin_size = 5;
 const double horizon_distance = 200;
 
 // thresholds
-const double lidar_near_sqr_thresh = 4, // m^2
+const double lidar_near_sqr_thresh = 9, // m^2
              closest_point_y = 1, // m in vehicle frame
              furthest_point_y = 15, // m in vehicle frame
              ground_min_height = -3, // m in vehicle frame
@@ -154,7 +154,9 @@ Eigen::Matrix4d T_global_lidar(pose_p pose) {
 vector<Point> project(Cloud::ConstPtr cloud,
                       const_pose_p pose,
                       vector<int> &valid_indices,
-                      bool clean) {
+                      bool clean,
+                      vector<double> &depth
+                      ) {
     vector<Point> pixels;
     auto extrinsic = T_vehicle_camera_left.inverse() * pose->inverse();
     for(int i=0; i<cloud->size(); i++) {
@@ -173,6 +175,7 @@ vector<Point> project(Cloud::ConstPtr cloud,
         }
         valid_indices.push_back(i);
         pixels.push_back(p);
+        depth.push_back(pixel[2]);
     }
     return pixels;
 }
@@ -350,14 +353,16 @@ Mat processFrame(const deque<Mat> &camera_frames,
     double ground_height;
     getGroundPlane(lidar_filtered, pose, ground, otherstuff, ground_height);
     vector<int> valid_indices;
-    auto ground_pixels = project(ground, pose, valid_indices, true);
+    vector<double> ground_depth;
+    auto ground_pixels = project(ground, pose, valid_indices, true, ground_depth);
     map<int, int> valid_map;
     for(int i=0; i<valid_indices.size(); i++) valid_map[valid_indices[i]] = i;
 
     Mat out;
     cvtColor(camera_frames[0], out, COLOR_GRAY2BGR);
     vector<int> valid_indices_other;
-    auto other_pixels = project(otherstuff, pose, valid_indices_other, true);
+    vector<double> other_depth;
+    auto other_pixels = project(otherstuff, pose, valid_indices_other, true, other_depth);
     for(int i=0; i<other_pixels.size(); i++) {
         circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
     }
@@ -369,7 +374,8 @@ Mat processFrame(const deque<Mat> &camera_frames,
     vector<vector<vector<double>>> binned_colours(width/pixel_bin_size, vector<vector<double>>(height/pixel_bin_size));
     for(int i=camera_frames.size()-1; i>=0; i--) {
         vector<int> valid_indices2;
-        auto ground_pixels2 = project(ground, pose_frames[i], valid_indices2, true);
+        vector<double> ground_pixels2_depth;
+        auto ground_pixels2 = project(ground, pose_frames[i], valid_indices2, true, ground_pixels2_depth);
         for(int j=0; j<valid_indices2.size(); j++) {
             int k=valid_indices2[j];
             if(!valid_map.count(k)) continue; // we only care about pixels in the current frame
@@ -420,6 +426,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
     }
     Mat out2;
     cvtColor(camera_frames[0], out2, COLOR_GRAY2BGR);
+    /*
     for(int u=0; u<binned_colours.size(); u++) {
         for(int v=0; v<binned_colours[u].size(); v++) {
             if(binned_colours[u][v].size() > 0) {
@@ -438,6 +445,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
             }
         }
     }
+    */
     Mat out3;
     cvtColor(camera_frames[0], out3, COLOR_GRAY2BGR);
     for(int u=0; u<binned_colours.size(); u++) {
@@ -470,12 +478,47 @@ Mat processFrame(const deque<Mat> &camera_frames,
                     horizon_distance * cos(i*PI/1800.0),
                     ground_height));
     }
-    auto horizon = project(horizon_points, pose, valid_indices, true);
+    vector<double>horizon_depth;
+    auto horizon = project(horizon_points, pose, valid_indices, true, horizon_depth);
     Mat out4;
     cvtColor(camera_frames[0], out4, COLOR_GRAY2BGR);
+    map<double, double> horizon_height;
+    double horizon_y = 0;
     for(auto p : horizon) {
-        circle(out4, p, 3, Scalar(0,100,255), 1, 8, 0);
+        //horizon_height[p.x] = p.y;
+        //circle(out4, p, 3, Scalar(0,100,255), 1, 8, 0);
+        horizon_y += p.y;
     }
+    horizon_y /= horizon.size();
+    vector<vector<vector<double>>> depth_map(width/pixel_bin_size, vector<vector<double>>(height/pixel_bin_size));
+    for(int i=0; i<other_pixels.size(); i++) {
+        auto p = other_pixels[i];
+        double z = other_depth[i];
+        int pixel_u = p.x / pixel_bin_size,
+            pixel_v = p.y / pixel_bin_size;
+        if(pixel_u >=0 && pixel_u < depth_map.size() &&
+                pixel_v >=0 && pixel_v < depth_map[pixel_u].size()) {
+            depth_map[pixel_u][pixel_v].push_back(z);
+        }
+    }
+    for(int u=0; u<depth_map.size(); u++) {
+        for(int v=0; v<depth_map[u].size(); v++) {
+            if(depth_map[u][v].empty() && v * pixel_bin_size <= horizon_y) {
+                depth_map[u][v].push_back(1e9);
+            }
+            sort(depth_map[u][v].begin(), depth_map[u][v].end());
+
+            uchar z = 0;// depth_map[u][v][depth_map[u][v].size() * 0.2];
+            if(z < 0) z = 0;
+            if(z > 255) z = 255;
+            rectangle(out4,
+                Point(u*pixel_bin_size, v*pixel_bin_size),
+                Point((u+1)*pixel_bin_size, (v+1)*pixel_bin_size),
+                Scalar(z, 100, 255-z), CV_FILLED);
+        }
+    }
+
+    // combine for display
     Mat outh1, outh2, outv;
     hconcat(out, out2, outh1);
     hconcat(out3, out4, outh2);
