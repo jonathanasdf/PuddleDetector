@@ -66,12 +66,13 @@ const double horizon_distance = 200;
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
-             closest_point_y = 4, // m in vehicle frame
+             closest_point_y = 1, // m in vehicle frame
              furthest_point_y = 15, // m in vehicle frame
              ground_min_height = -3, // m in vehicle frame
              ground_max_height = -0.5, // m in vehicle frame
              ground_distance_thresh = 0.2, // m
-             ground_neighbourhood = 100; // m^2
+             ground_neighbourhood = 100, // m^2
+             variance_threshold = 700; // m^2
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -155,12 +156,17 @@ vector<Point> project(Cloud::ConstPtr cloud,
                       vector<int> &valid_indices,
                       bool clean) {
     vector<Point> pixels;
-    auto projection = T_projection * T_vehicle_camera_left.inverse();
+    auto extrinsic = T_vehicle_camera_left.inverse() * pose->inverse();
     for(int i=0; i<cloud->size(); i++) {
         auto pt = cloud->at(i);
-        Eigen::Vector3d pixel = projection * pt.getVector4fMap().cast<double>();
-        if(clean && pixel[2] <= 0) continue; // behind camera
+        Eigen::Vector4d v = pt.getVector4fMap().cast<double>();
+        v = extrinsic * v;
+        if(v[3] == 0) continue; // point at infinity
+        if(v[2] / v[3] < 0) continue; // point behind camera
+
+        Eigen::Vector3d pixel = T_projection * v;
         Point p(pixel[0]/pixel[2], pixel[1]/pixel[2]);
+        if(clean && pixel[2] <= 0) continue; // behind camera
         if(clean && (p.x < 0 || p.x > 2 * cx || p.y < 0 || p.y > 2 * cy)) {
             // outside of frame
             continue;
@@ -176,12 +182,25 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
                     Cloud::Ptr stuff_cloud,
                     double &ground_height) {
 /*
+    // Transform cloud to local frame to filter
     vector<int> filtered;
-    PassThrough<PointXYZ> pass;
-    pass.setInputCloud(in_cloud);
-    pass.setFilterFieldName("z");
-    pass.setFilterLimits(ground_min_height, ground_max_height);
-    pass.filter(filtered);
+    Cloud::Ptr cloud_filtered(new Cloud);
+    auto T = pose->inverse();
+    for(int i=0; i<in_cloud->size(); i++) {
+        auto pt = in_cloud->at(i);
+        Eigen::Vector4d v = T * pt.getVector4fMap().cast<double>();
+        if(v[3] == 0) continue; // point at infinity
+        if(v[1] / v[3] < 0) continue; // point behind camera
+        if(v[1] / v[3] < closest_point_y) continue; // point too close
+        if(v[1] / v[3] > furthest_point_y) continue; // point too far ahead
+        pt.x = v[0] / v[3];
+        pt.y = v[1] / v[3];
+        pt.z = v[2] / v[3];
+        if (pt.z >= ground_min_height && pt.z <= ground_max_height) {
+          filtered.push_back(i);
+          cloud_filtered->push_back(pt);
+        }
+    }
 
     // extract unfiltered indices into stuff_cloud
     Cloud::Ptr ground_in(new Cloud);
@@ -327,43 +346,33 @@ Mat processFrame(const deque<Mat> &camera_frames,
 
     auto pose = pose_frames[0];
 
-    // Transform point to current frame
-    lidar_aggregation.swap(lidar_filtered);
-    lidar_filtered->clear();
-    auto T = pose->inverse();
-    for(int i=0; i<lidar_aggregation->size(); i++) {
-        auto pt = lidar_aggregation->at(i);
-        Eigen::Vector4d v = T * pt.getVector4fMap().cast<double>();
-        if(v[3] == 0) continue; // point at infinity
-        if(v[1] / v[3] < 0) continue; // point behind camera
-        if(v[1] / v[3] < closest_point_y) continue; // point too close
-        if(v[1] / v[3] > furthest_point_y) continue; // point too far ahead
-        pt.x = v[0] / v[3];
-        pt.y = v[1] / v[3];
-        pt.z = v[2] / v[3];
-        lidar_filtered->push_back(pt);
-    }
-
     Cloud::Ptr ground(new Cloud), otherstuff(new Cloud);
     double ground_height;
     getGroundPlane(lidar_filtered, pose, ground, otherstuff, ground_height);
     vector<int> valid_indices;
     auto ground_pixels = project(ground, pose, valid_indices, true);
+    map<int, int> valid_map;
+    for(int i=0; i<valid_indices.size(); i++) valid_map[valid_indices[i]] = i;
 
     Mat out;
     cvtColor(camera_frames[0], out, COLOR_GRAY2BGR);
     vector<int> valid_indices_other;
     auto other_pixels = project(otherstuff, pose, valid_indices_other, true);
-    for (int i=0; i<other_pixels.size(); i++) {
+    for(int i=0; i<other_pixels.size(); i++) {
         circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
+    }
+    for(int i=0; i<ground_pixels.size(); i++) {
+        circle(out, ground_pixels[i], 3, Scalar(0, 0, 255), 1, 8, 0);
     }
 
     map<Point, vector<double>> ground_colours;
     vector<vector<vector<double>>> binned_colours(width/pixel_bin_size, vector<vector<double>>(height/pixel_bin_size));
     for(int i=camera_frames.size()-1; i>=0; i--) {
-        vector<int> valid_indices;
-        auto ground_pixels2 = project(ground, pose_frames[i], valid_indices, true);
-        for(int j=0; j<valid_indices.size(); j++) {
+        vector<int> valid_indices2;
+        auto ground_pixels2 = project(ground, pose_frames[i], valid_indices2, true);
+        for(int j=0; j<valid_indices2.size(); j++) {
+            int k=valid_indices2[j];
+            if(!valid_map.count(k)) continue; // we only care about pixels in the current frame
             //if (ground_pixels2[j].x < normalization_patch_radius || ground_pixels2[j].x + normalization_patch_radius >= out.cols ||
             //    ground_pixels2[j].y < normalization_patch_radius || ground_pixels2[j].y + normalization_patch_radius >= out.rows) {
             //    continue;
@@ -377,11 +386,11 @@ Mat processFrame(const deque<Mat> &camera_frames,
             //}
             //double area = (2*normalization_patch_radius+1)*(2*normalization_patch_radius+1);
             //colour /= sum/area;
-            ground_colours[ground_pixels[valid_indices[j]]].push_back(colour);
-            int pixel_u = ground_pixels[valid_indices[j]].x / pixel_bin_size,
-                pixel_v = ground_pixels[valid_indices[j]].y / pixel_bin_size;
+            ground_colours[ground_pixels[valid_map[k]]].push_back(colour);
+            int pixel_u = ground_pixels[valid_map[k]].x / pixel_bin_size,
+                pixel_v = ground_pixels[valid_map[k]].y / pixel_bin_size;
             if(pixel_u >=0 && pixel_u < binned_colours.size() &&
-                    pixel_v >=0 && pixel_v < binned_colours[pixel_u].size()) {
+               pixel_v >=0 && pixel_v < binned_colours[pixel_u].size()) {
                 binned_colours[pixel_u][pixel_v].push_back(colour);
             }
         }
@@ -390,12 +399,14 @@ Mat processFrame(const deque<Mat> &camera_frames,
 
     for(auto p : ground_colours) {
         vector<double> colours(p.second.begin(), p.second.end());
-        /*
+        //*
         if (colours.size() < min_colour_samples) continue;
         accumulator_set<double, stats<tag::variance(lazy)> > acc;
         for(auto c : colours) acc(c);
         double v = variance(acc);
-        circle(out, p.first, 3, Scalar(max(0., 255-v/150*255), 0, 255), 1, 8, 0);
+        if (v > variance_threshold) {
+        //  circle(out, p.first, 3, Scalar(255, 150, 0), 1, 8, 0);
+        }
         /*/
 
         double max_colour = 0;
