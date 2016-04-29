@@ -65,7 +65,7 @@ const int pixel_bin_size = 5;
 const double horizon_distance = 200;
 
 // thresholds
-const double lidar_near_sqr_thresh = 9, // m^2
+const double lidar_near_sqr_thresh = 25, // m^2
              closest_point_y = 0, // m in vehicle frame
              furthest_point_y = 15, // m in vehicle frame
              ground_min_height = -3, // m in vehicle frame
@@ -184,7 +184,7 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
                     Cloud::Ptr ground_cloud,
                     Cloud::Ptr stuff_cloud,
                     double &ground_height) {
-//*
+/*
     // Transform cloud to local frame to filter
     vector<int> filtered;
     Cloud::Ptr cloud_filtered(new Cloud);
@@ -370,6 +370,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
         //circle(out, ground_pixels[i], 3, Scalar(0, 0, 255), 1, 8, 0);
     }
 
+#ifdef out1
     map<Point, vector<double>> ground_colours;
     vector<vector<vector<double>>> binned_colours(width/pixel_bin_size, vector<vector<double>>(height/pixel_bin_size));
     for(int i=camera_frames.size()-1; i>=0; i--) {
@@ -424,8 +425,6 @@ Mat processFrame(const deque<Mat> &camera_frames,
         circle(out, p.first, 3, Scalar(0, v/2, v), 1, 8, 0);
         //*/
     }
-    Mat out2;
-    cvtColor(camera_frames[0], out2, COLOR_GRAY2BGR);
     /*
     for(int u=0; u<binned_colours.size(); u++) {
         for(int v=0; v<binned_colours[u].size(); v++) {
@@ -450,7 +449,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
     cvtColor(camera_frames[0], out3, COLOR_GRAY2BGR);
     for(int u=0; u<binned_colours.size(); u++) {
         for(int v=0; v<binned_colours[u].size(); v++) {
-            if(v < binned_colours[u].size()/3) continue;
+            if(v * pixel_bin_size < horizon_y) continue;
             vector<uchar> colours;
             for(int i=u*pixel_bin_size; i<(u+1)*pixel_bin_size; i++) {
                 for(int j=v*pixel_bin_size; j<(v+1)*pixel_bin_size; j++) {
@@ -470,6 +469,9 @@ Mat processFrame(const deque<Mat> &camera_frames,
             }
         }
     }
+#endif
+    Mat out2;
+    cvtColor(camera_frames[0], out2, COLOR_GRAY2BGR);
 
     Cloud::Ptr horizon_points(new Cloud);
     for(int i=0; i<3600; i++) {
@@ -491,6 +493,34 @@ Mat processFrame(const deque<Mat> &camera_frames,
     }
     horizon_y /= horizon.size();
     vector<vector<vector<double>>> depth_map(width/pixel_bin_size, vector<vector<double>>(height/pixel_bin_size));
+    vector<vector<int>> ground_mask(width/pixel_bin_size, vector<int>(height/pixel_bin_size, 0));
+    for(int u=0; u<ground_mask.size(); u++) {
+        for(int v=0; v<ground_mask[u].size(); v++) {
+            if(v*pixel_bin_size > horizon_y) {
+                ground_mask[u][v] = 1;
+            }
+        }
+    }
+    for(auto p : other_pixels) {
+        int pixel_u = p.x / pixel_bin_size,
+            pixel_v = p.y / pixel_bin_size;
+        ground_mask[pixel_u][pixel_v] = 0;
+    }
+    for(auto p : ground_pixels) {
+        int pixel_u = p.x / pixel_bin_size,
+            pixel_v = p.y / pixel_bin_size;
+        ground_mask[pixel_u][pixel_v] = 1;
+    }
+    for(int u=0; u<ground_mask.size(); u++) {
+        for(int v=0; v<ground_mask[u].size(); v++) {
+            Rect r(u*pixel_bin_size, v*pixel_bin_size,
+                    pixel_bin_size, pixel_bin_size);
+            uchar z = 0;
+            if(ground_mask[u][v])
+                z = 255;
+            rectangle(out4, r, Scalar(z, z, z), CV_FILLED);
+        }
+    }
     for(int i=0; i<other_pixels.size(); i++) {
         auto p = other_pixels[i];
         double z = other_depth[i];
@@ -498,6 +528,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
             pixel_v = p.y / pixel_bin_size;
         if(pixel_u >=0 && pixel_u < depth_map.size() &&
                 pixel_v >=0 && pixel_v < depth_map[pixel_u].size()) {
+            if(ground_mask[pixel_u][pixel_v]) continue;
             depth_map[pixel_u][pixel_v].push_back(z);
         }
     }
@@ -505,25 +536,40 @@ Mat processFrame(const deque<Mat> &camera_frames,
         for(int v=0; v<depth_map[u].size(); v++) {
             if(depth_map[u][v].empty() && v * pixel_bin_size <= horizon_y) {
                 depth_map[u][v].push_back(1e9);
-            }
+            } else if(depth_map[u][v].size() < 10) continue;
             sort(depth_map[u][v].begin(), depth_map[u][v].end());
 
-            uchar z = 0;// depth_map[u][v][depth_map[u][v].size() * 0.2];
+            int k = (int)((double) (depth_map[u][v].size()) * 0.5);
+            double zz = depth_map[u][v][k];
+            int yy = (horizon_y - (v-1)*pixel_bin_size) + horizon_y + (4.0 * focal_length / zz);
+            Rect r(u*pixel_bin_size, v*pixel_bin_size,
+                    pixel_bin_size, pixel_bin_size);
+            Rect r2(u*pixel_bin_size, yy,
+                    pixel_bin_size, pixel_bin_size);
+            if((u+1)*pixel_bin_size >= width ||
+                    (v+1)*pixel_bin_size >= height ||
+                    yy < 0 || yy + pixel_bin_size >= height) {
+                continue;
+            }
+            if(yy/pixel_bin_size < ground_mask[u].size() && !ground_mask[u][yy/pixel_bin_size])
+                continue;
+            Mat src = out2(r);
+            Mat dst = out4(r2);
+            flip(src, dst, 0);
+            uchar z = zz;
             if(z < 0) z = 0;
             if(z > 255) z = 255;
-            rectangle(out4,
-                Point(u*pixel_bin_size, v*pixel_bin_size),
-                Point((u+1)*pixel_bin_size, (v+1)*pixel_bin_size),
-                Scalar(z, 100, 255-z), CV_FILLED);
         }
     }
+    return out4;
 
+    /*
     // combine for display
     Mat outh1, outh2, outv;
     hconcat(out, out2, outh1);
     hconcat(out3, out4, outh2);
     vconcat(outh1, outh2, outv);
-    return out;
+    */
 }
 
 int main(int argc, char **argv) {
