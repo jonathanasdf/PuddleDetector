@@ -66,6 +66,7 @@ const double horizon_distance = 200;
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
+             closest_point_y = 4, // m in vehicle frame
              furthest_point_y = 15, // m in vehicle frame
              ground_min_height = -3, // m in vehicle frame
              ground_max_height = -0.5, // m in vehicle frame
@@ -335,6 +336,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
         Eigen::Vector4d v = T * pt.getVector4fMap().cast<double>();
         if(v[3] == 0) continue; // point at infinity
         if(v[1] / v[3] < 0) continue; // point behind camera
+        if(v[1] / v[3] < closest_point_y) continue; // point too close
         if(v[1] / v[3] > furthest_point_y) continue; // point too far ahead
         pt.x = v[0] / v[3];
         pt.y = v[1] / v[3];
@@ -410,16 +412,16 @@ Mat processFrame(const deque<Mat> &camera_frames,
     for(int u=0; u<binned_colours.size(); u++) {
         for(int v=0; v<binned_colours[u].size(); v++) {
             if(binned_colours[u][v].size() > 0) {
-                rectangle(out2, 
-                    Point(u*pixel_bin_size, v*pixel_bin_size), 
+                rectangle(out2,
+                    Point(u*pixel_bin_size, v*pixel_bin_size),
                     Point((u+1)*pixel_bin_size, (v+1)*pixel_bin_size),
                     Scalar(0, 150, 250), CV_FILLED);
             }
             if(binned_colours[u][v].size() < min_colour_samples) continue;
             sort(binned_colours[u][v].begin(), binned_colours[u][v].end());
             if(binned_colours[u][v][binned_colours[u][v].size()*2/3] > 180) {
-                rectangle(out2, 
-                    Point(u*pixel_bin_size, v*pixel_bin_size), 
+                rectangle(out2,
+                    Point(u*pixel_bin_size, v*pixel_bin_size),
                     Point((u+1)*pixel_bin_size, (v+1)*pixel_bin_size),
                     Scalar(255, 150, 0), CV_FILLED);
             }
@@ -439,11 +441,11 @@ Mat processFrame(const deque<Mat> &camera_frames,
             }
             sort(colours.begin(), colours.end());
             uchar z = 0;
-            if(colours[colours.size()/2] > 200) 
+            if(colours[colours.size()/2] > 200)
                 z = 1;
             if(z > 0) {
-                rectangle(out3, 
-                    Point(u*pixel_bin_size, v*pixel_bin_size), 
+                rectangle(out3,
+                    Point(u*pixel_bin_size, v*pixel_bin_size),
                     Point((u+1)*pixel_bin_size, (v+1)*pixel_bin_size),
                     Scalar(255*z, 150*z, 0), CV_FILLED);
             }
@@ -472,6 +474,9 @@ Mat processFrame(const deque<Mat> &camera_frames,
 
 int main(int argc, char **argv) {
     loadData();
+
+    bool outputVideoOpen = false;
+    VideoWriter outputVideo;
 
     char video[] = "video";
     cvNamedWindow(video);
@@ -519,13 +524,22 @@ int main(int argc, char **argv) {
             lidar_path_it++;
         }
 
-        if(lidar_frames.size() < min_lidar_frames_needed) {
-            // not enough lidar data to do anything, just show frame
-            imshow(video, camera);
-        } else {
+        if(lidar_frames.size() >= min_lidar_frames_needed) {
             // process frame
             auto img = processFrame(camera_frames, pose_frames, lidar_frames);
             imshow(video, img);
+            if(argc > 1) {
+                if(!outputVideoOpen) {
+                    Size size(img.cols, img.rows);
+                    outputVideo.open(argv[1], 875967064, 30, size, true);
+                    if(!outputVideo.isOpened()) {
+                        cout  << "Could not open the output video for write: " << argv[1] << endl;
+                        return -1;
+                    }
+                    outputVideoOpen = true;
+                }
+                outputVideo << img;
+            }
         }
     }
     cvWaitKey();
