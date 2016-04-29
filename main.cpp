@@ -66,13 +66,13 @@ const double horizon_distance = 200;
 
 // thresholds
 const double lidar_near_sqr_thresh = 9, // m^2
-             closest_point_y = 1, // m in vehicle frame
+             closest_point_y = 0, // m in vehicle frame
              furthest_point_y = 15, // m in vehicle frame
              ground_min_height = -3, // m in vehicle frame
              ground_max_height = -0.5, // m in vehicle frame
              ground_distance_thresh = 0.2, // m
              ground_neighbourhood = 100, // m^2
-             variance_threshold = 700; // m^2
+             variance_threshold = 800; // m^2
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -184,7 +184,7 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
                     Cloud::Ptr ground_cloud,
                     Cloud::Ptr stuff_cloud,
                     double &ground_height) {
-/*
+//*
     // Transform cloud to local frame to filter
     vector<int> filtered;
     Cloud::Ptr cloud_filtered(new Cloud);
@@ -364,10 +364,10 @@ Mat processFrame(const deque<Mat> &camera_frames,
     vector<double> other_depth;
     auto other_pixels = project(otherstuff, pose, valid_indices_other, true, other_depth);
     for(int i=0; i<other_pixels.size(); i++) {
-        circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
+        //circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
     }
     for(int i=0; i<ground_pixels.size(); i++) {
-        circle(out, ground_pixels[i], 3, Scalar(0, 0, 255), 1, 8, 0);
+        //circle(out, ground_pixels[i], 3, Scalar(0, 0, 255), 1, 8, 0);
     }
 
     map<Point, vector<double>> ground_colours;
@@ -411,7 +411,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
         for(auto c : colours) acc(c);
         double v = variance(acc);
         if (v > variance_threshold) {
-        //  circle(out, p.first, 3, Scalar(255, 150, 0), 1, 8, 0);
+          circle(out, p.first, 3, Scalar(255, 150, 0), 1, 8, 0);
         }
         /*/
 
@@ -523,7 +523,7 @@ Mat processFrame(const deque<Mat> &camera_frames,
     hconcat(out, out2, outh1);
     hconcat(out3, out4, outh2);
     vconcat(outh1, outh2, outv);
-    return outv;
+    return out;
 }
 
 int main(int argc, char **argv) {
