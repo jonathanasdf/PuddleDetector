@@ -24,7 +24,6 @@
 #include <pcl/filters/extract_indices.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl/filters/project_inliers.h>
-#include <pcl/filters/statistical_outlier_removal.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/ModelCoefficients.h>
 #include <pcl/point_types.h>
@@ -42,6 +41,9 @@ typedef PointCloud<PointXYZ> Cloud;
 typedef shared_ptr<Eigen::Matrix4d> pose_p;
 typedef shared_ptr<const Eigen::Matrix4d> const_pose_p;
 typedef PointCloud<PointXYZ> Cloud;
+namespace cv {
+bool operator<(const Point a, const Point b) { return (a.x < b.x) || (a.x == b.x && a.y < b.y); }
+}
 
 /************************* GLOBAL VARIABLES ************************/
 // Configuration
@@ -51,6 +53,10 @@ const int ransac_iterations = 100;
 const float voxel_size = 0.1; // m or lidar units
 const int histogram_size = 30,
           histogram_offset = 40;
+const int normalization_patch_radius = 2, // pixels
+          min_colour_samples = 15,
+          specularity_colour_threshold = 10,
+          specular_within_threshold_limit = 10;
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
@@ -187,7 +193,7 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     seg.setMaxIterations(ransac_iterations);
     seg.setInputCloud(ground_in);
     seg.segment(*inliers, coefficients);
-    cout << coefficients << endl;
+    //cerr << coefficients << endl;
 
     // extract the plane into a new point cloud
     Cloud::Ptr ground_plane(new Cloud);
@@ -209,7 +215,7 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     proj.filter(*ground_cloud);
 /*
     double pose_z = (*pose)(2,3);
-    cout << pose_z << endl;
+    cerr << pose_z << endl;
     vector<int> histogram(histogram_size, 0);
     for(auto p : tmp->points) {
         double x = p.x - (*pose)(0,3),
@@ -227,7 +233,7 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
         }
     }
     double ground_height = (mode - histogram_offset) * ground_distance_thresh;
-    cout << ground_height << endl;
+    cerr << ground_height << endl;
     for(auto p : tmp->points) {
         if(abs(p.z - pose_z - ground_height) < ground_distance_thresh) {
             ground_cloud->push_back(p);
@@ -323,32 +329,51 @@ Mat processFrame(const deque<Mat> &camera_frames,
 
     Cloud::Ptr ground(new Cloud), otherstuff(new Cloud);
     getGroundPlane(lidar_filtered, pose, ground, otherstuff);
+    vector<int> valid_indices;
+    auto ground_pixels = project(ground, pose, valid_indices);
 
     Mat out;
     cvtColor(camera_frames[0], out, COLOR_GRAY2BGR);
     vector<int> valid_indices_other;
     auto other_pixels = project(otherstuff, pose, valid_indices_other);
     for (int i=0; i<other_pixels.size(); i++) {
-        circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
+        //circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
     }
-    vector<vector<uchar>> ground_colours(ground->size());
+
+    map<Point, vector<uchar>> ground_colours;
     for(int i=camera_frames.size()-1; i>=0; i--) {
         vector<int> valid_indices;
-        auto ground_pixels = project(ground, pose_frames[i], valid_indices);
+        auto ground_pixels2 = project(ground, pose_frames[i], valid_indices);
         for(int j=0; j<valid_indices.size(); j++) {
-            auto colour = camera_frames[i].at<uchar>(ground_pixels[j]);
-            ground_colours[valid_indices[j]].push_back(colour);
-        }
-        if(i==0) {
-            for(int i=0; i<ground_pixels.size(); i++) {
-                uchar min_colour = 255, max_colour = 0;
-                for(auto c : ground_colours[i]) {
-                    if(c < min_colour) min_colour = c;
-                    if(c > max_colour) max_colour = c;
-                }
-                uchar q = max(0, max_colour - min_colour);
-                circle(out, ground_pixels[i], 3, Scalar(q, 50, 255 - q), 1, 8, 0);
+            if (ground_pixels2[j].x < normalization_patch_radius || ground_pixels2[j].x + normalization_patch_radius >= out.cols ||
+                ground_pixels2[j].y < normalization_patch_radius || ground_pixels2[j].y + normalization_patch_radius >= out.rows) {
+                continue;
             }
+            auto colour = camera_frames[i].at<uchar>(ground_pixels2[j]);
+            double sum = 0;
+            for (int a=-normalization_patch_radius; a <= normalization_patch_radius; a++) {
+                for (int b=-normalization_patch_radius; b <= normalization_patch_radius; b++) {
+                    double s = camera_frames[i].at<uchar>(ground_pixels2[j].y + b, ground_pixels2[j].x + a);
+                    sum += s*s;
+                }
+            }
+            colour /= sqrt(sum);
+            ground_colours[ground_pixels[valid_indices[j]]].push_back(colour);
+        }
+    }
+    for(auto p : ground_colours) {
+        vector<uchar> colours(p.second.begin(), p.second.end());
+        if (colours.size() < min_colour_samples) continue;
+        sort(colours.begin(), colours.end());
+        int front = 0, back = 0, mx = 1;
+        while(front < colours.size()) {
+          while(back < front && colours[front] - colours[back] > specularity_colour_threshold) back++;
+          mx = max(mx, front-back+1);
+          front++;
+        }
+        if (mx <= specular_within_threshold_limit) {
+          cout << mx << endl;
+          circle(out, p.first, 3, Scalar(0, 255, 0), 1, 8, 0);
         }
     }
     return out;
@@ -390,7 +415,7 @@ int main(int argc, char **argv) {
         auto pose = getClosestFrame(frame, poses);
         pose_frames.push_front(pose);
         if(pose_frames.size() > num_frames_to_keep) pose_frames.pop_back();
-        cerr << "Current pose: " << endl << *pose << endl;
+        //cerr << "Current pose: " << endl << *pose << endl;
 
         // read lidar
         while(lidar_path_it != lidar_paths.end() && lidar_path_it->first < frame) {
