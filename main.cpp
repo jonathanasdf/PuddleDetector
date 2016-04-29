@@ -50,15 +50,19 @@ bool operator<(const Point a, const Point b) { return (a.x < b.x) || (a.x == b.x
 }
 
 /************************* GLOBAL VARIABLES ************************/
+const double PI = 3.1415926535897932384626433832795028;
 // Configuration
 const int num_frames_to_keep = 20;
-const int min_lidar_frames_needed = 5;
+const int min_lidar_frames_needed = 10;
 const int ransac_iterations = 100;
 const float voxel_size = 0.1; // m or lidar units
-const int histogram_size = 30,
+const int histogram_size = 40,
           histogram_offset = 40;
 const int normalization_patch_radius = 2, // pixels
-          min_colour_samples = 20;
+          min_colour_samples = 9;
+const int pixel_bin_size = 5;
+
+const double horizon_distance = 200;
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
@@ -66,7 +70,7 @@ const double lidar_near_sqr_thresh = 4, // m^2
              ground_min_height = -3, // m in vehicle frame
              ground_max_height = -0.5, // m in vehicle frame
              ground_distance_thresh = 0.2, // m
-             ground_neighbourhood = 30; // m^2
+             ground_neighbourhood = 100; // m^2
 
 // Data paths
 map<ts, path> left_img_paths, right_img_paths, lidar_paths;
@@ -87,6 +91,7 @@ Eigen::Matrix4d T_vehicle_camera_left {{1,       0,       0, -0.0140},
 const double focal_length = 469.1630, // pixels
                        cx = 508.5, // pixels
                        cy = 285.5; // pixels
+const int width = 1024, height = 544;
 
 Eigen::Matrix<double, 3, 4> T_projection {{focal_length, 0, cx, 0},
                                           {0, focal_length, cy, 0},
@@ -146,14 +151,16 @@ Eigen::Matrix4d T_global_lidar(pose_p pose) {
 // Get transform from camera frame to image pixel
 vector<Point> project(Cloud::ConstPtr cloud,
                       const_pose_p pose,
-                      vector<int> &valid_indices) {
+                      vector<int> &valid_indices,
+                      bool clean) {
     vector<Point> pixels;
     auto projection = T_projection * T_vehicle_camera_left.inverse();
     for(int i=0; i<cloud->size(); i++) {
         auto pt = cloud->at(i);
         Eigen::Vector3d pixel = projection * pt.getVector4fMap().cast<double>();
+        if(clean && pixel[2] <= 0) continue; // behind camera
         Point p(pixel[0]/pixel[2], pixel[1]/pixel[2]);
-        if(p.x < 0 || p.x > 2 * cx || p.y < 0 || p.y > 2 * cy) {
+        if(clean && (p.x < 0 || p.x > 2 * cx || p.y < 0 || p.y > 2 * cy)) {
             // outside of frame
             continue;
         }
@@ -165,7 +172,9 @@ vector<Point> project(Cloud::ConstPtr cloud,
 void getGroundPlane(Cloud::ConstPtr in_cloud,
                     const_pose_p pose,
                     Cloud::Ptr ground_cloud,
-                    Cloud::Ptr stuff_cloud) {
+                    Cloud::Ptr stuff_cloud,
+                    double &ground_height) {
+/*
     vector<int> filtered;
     PassThrough<PointXYZ> pass;
     pass.setInputCloud(in_cloud);
@@ -183,7 +192,6 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     extract.setNegative(true);
     extract.filter(*stuff_cloud);
 
-/*
     ModelCoefficients coefficients;
     PointIndices::Ptr inliers(new PointIndices);
     // segment it!
@@ -217,27 +225,32 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     proj.filter(*ground_cloud);
 /*/
     double pose_z = (*pose)(2,3);
-    cerr << pose_z << endl;
     vector<int> histogram(histogram_size, 0);
-    for(auto p : ground_in->points) {
+    for(auto p : in_cloud->points) {
         double x = p.x - (*pose)(0,3),
                y = p.y - (*pose)(1,3),
                z = p.z - (*pose)(2,3);
         if(x*x + y*y + z*z > ground_neighbourhood) continue;
         int zz = round((p.z - pose_z)/ground_distance_thresh) + histogram_offset;
-        if(zz >= 0 && zz < histogram_size) histogram[zz]++;
-    }
-    int hist_max = 0, mode = 0;
-    for(int i=0; i<histogram_size; i++) {
-        if(histogram[i] > hist_max) {
-            hist_max = histogram[i];
-            mode = i;
+        for(int zzz=zz-1; zzz<=zz+1; zzz++) {
+            if(zzz >= 0 && zzz < histogram_size) histogram[zzz]++;
         }
     }
-    double ground_height = (mode - histogram_offset) * ground_distance_thresh;
+    int hist_max = 0, mode = 0;
+    cerr << "Histogram: ";
+    for(int i=1; i<histogram_size-1; i++) {
+        if(histogram[i] > histogram[i-1] && histogram[i] > histogram[i+1]) {
+            hist_max = histogram[i];
+            mode = i;
+            break;
+        }
+        cerr << histogram[i] << " ";
+    }
+    cerr << endl;
+    ground_height = (mode - histogram_offset) * ground_distance_thresh;
     cerr << ground_height << endl;
-    for(auto p : ground_in->points) {
-        if(abs(p.z - pose_z - ground_height) < ground_distance_thresh) {
+    for(auto p : in_cloud->points) {
+        if(abs(p.z - pose_z - ground_height) < 2*ground_distance_thresh) {
             ground_cloud->push_back(p);
         } else {
             stuff_cloud->push_back(p);
@@ -330,22 +343,24 @@ Mat processFrame(const deque<Mat> &camera_frames,
     }
 
     Cloud::Ptr ground(new Cloud), otherstuff(new Cloud);
-    getGroundPlane(lidar_filtered, pose, ground, otherstuff);
+    double ground_height;
+    getGroundPlane(lidar_filtered, pose, ground, otherstuff, ground_height);
     vector<int> valid_indices;
-    auto ground_pixels = project(ground, pose, valid_indices);
+    auto ground_pixels = project(ground, pose, valid_indices, true);
 
     Mat out;
     cvtColor(camera_frames[0], out, COLOR_GRAY2BGR);
     vector<int> valid_indices_other;
-    auto other_pixels = project(otherstuff, pose, valid_indices_other);
+    auto other_pixels = project(otherstuff, pose, valid_indices_other, true);
     for (int i=0; i<other_pixels.size(); i++) {
-        //circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
+        circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
     }
 
     map<Point, vector<double>> ground_colours;
+    vector<vector<vector<double>>> binned_colours(width/pixel_bin_size, vector<vector<double>>(height/pixel_bin_size));
     for(int i=camera_frames.size()-1; i>=0; i--) {
         vector<int> valid_indices;
-        auto ground_pixels2 = project(ground, pose_frames[i], valid_indices);
+        auto ground_pixels2 = project(ground, pose_frames[i], valid_indices, true);
         for(int j=0; j<valid_indices.size(); j++) {
             //if (ground_pixels2[j].x < normalization_patch_radius || ground_pixels2[j].x + normalization_patch_radius >= out.cols ||
             //    ground_pixels2[j].y < normalization_patch_radius || ground_pixels2[j].y + normalization_patch_radius >= out.rows) {
@@ -361,17 +376,98 @@ Mat processFrame(const deque<Mat> &camera_frames,
             //double area = (2*normalization_patch_radius+1)*(2*normalization_patch_radius+1);
             //colour /= sum/area;
             ground_colours[ground_pixels[valid_indices[j]]].push_back(colour);
+            int pixel_u = ground_pixels[valid_indices[j]].x / pixel_bin_size,
+                pixel_v = ground_pixels[valid_indices[j]].y / pixel_bin_size;
+            if(pixel_u >=0 && pixel_u < binned_colours.size() &&
+                    pixel_v >=0 && pixel_v < binned_colours[pixel_u].size()) {
+                binned_colours[pixel_u][pixel_v].push_back(colour);
+            }
         }
     }
+
+
     for(auto p : ground_colours) {
         vector<double> colours(p.second.begin(), p.second.end());
+        /*
         if (colours.size() < min_colour_samples) continue;
         accumulator_set<double, stats<tag::variance(lazy)> > acc;
         for(auto c : colours) acc(c);
         double v = variance(acc);
         circle(out, p.first, 3, Scalar(max(0., 255-v/150*255), 0, 255), 1, 8, 0);
+        /*/
+
+        double max_colour = 0;
+        for(auto c : colours) {
+            if(c > max_colour) max_colour = c;
+        }
+        //uchar v = max_colour > 180? 255 : 0;
+        uchar v = colours.back();
+        circle(out, p.first, 3, Scalar(0, v/2, v), 1, 8, 0);
+        //*/
     }
-    return out;
+    Mat out2;
+    cvtColor(camera_frames[0], out2, COLOR_GRAY2BGR);
+    for(int u=0; u<binned_colours.size(); u++) {
+        for(int v=0; v<binned_colours[u].size(); v++) {
+            if(binned_colours[u][v].size() > 0) {
+                rectangle(out2, 
+                    Point(u*pixel_bin_size, v*pixel_bin_size), 
+                    Point((u+1)*pixel_bin_size, (v+1)*pixel_bin_size),
+                    Scalar(0, 150, 250), CV_FILLED);
+            }
+            if(binned_colours[u][v].size() < min_colour_samples) continue;
+            sort(binned_colours[u][v].begin(), binned_colours[u][v].end());
+            if(binned_colours[u][v][binned_colours[u][v].size()*2/3] > 180) {
+                rectangle(out2, 
+                    Point(u*pixel_bin_size, v*pixel_bin_size), 
+                    Point((u+1)*pixel_bin_size, (v+1)*pixel_bin_size),
+                    Scalar(255, 150, 0), CV_FILLED);
+            }
+        }
+    }
+    Mat out3;
+    cvtColor(camera_frames[0], out3, COLOR_GRAY2BGR);
+    for(int u=0; u<binned_colours.size(); u++) {
+        for(int v=0; v<binned_colours[u].size(); v++) {
+            if(v < binned_colours[u].size()/3) continue;
+            vector<uchar> colours;
+            for(int i=u*pixel_bin_size; i<(u+1)*pixel_bin_size; i++) {
+                for(int j=v*pixel_bin_size; j<(v+1)*pixel_bin_size; j++) {
+                    uchar c = camera_frames[0].at<uchar>(j,i); // note it's j,i
+                    colours.push_back(c);
+                }
+            }
+            sort(colours.begin(), colours.end());
+            uchar z = 0;
+            if(colours[colours.size()/2] > 200) 
+                z = 1;
+            if(z > 0) {
+                rectangle(out3, 
+                    Point(u*pixel_bin_size, v*pixel_bin_size), 
+                    Point((u+1)*pixel_bin_size, (v+1)*pixel_bin_size),
+                    Scalar(255*z, 150*z, 0), CV_FILLED);
+            }
+        }
+    }
+
+    Cloud::Ptr horizon_points(new Cloud);
+    for(int i=0; i<3600; i++) {
+        horizon_points->push_back(PointXYZ(
+                    horizon_distance * sin(i*PI/1800.0),
+                    horizon_distance * cos(i*PI/1800.0),
+                    ground_height));
+    }
+    auto horizon = project(horizon_points, pose, valid_indices, true);
+    Mat out4;
+    cvtColor(camera_frames[0], out4, COLOR_GRAY2BGR);
+    for(auto p : horizon) {
+        circle(out4, p, 3, Scalar(0,100,255), 1, 8, 0);
+    }
+    Mat outh1, outh2, outv;
+    hconcat(out, out2, outh1);
+    hconcat(out3, out4, outh2);
+    vconcat(outh1, outh2, outv);
+    return outv;
 }
 
 int main(int argc, char **argv) {
