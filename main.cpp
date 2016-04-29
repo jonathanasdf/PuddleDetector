@@ -8,6 +8,9 @@
 #include <string>
 #include <vector>
 
+#include <boost/accumulators/accumulators.hpp>
+#include <boost/accumulators/statistics/stats.hpp>
+#include <boost/accumulators/statistics/variance.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem.hpp>
 
@@ -32,6 +35,7 @@
 #include <pcl/segmentation/sac_segmentation.h>
 #include <pcl/visualization/cloud_viewer.h>
 
+using namespace boost::accumulators;
 using namespace boost::filesystem;
 using namespace cv;
 using namespace pcl;
@@ -54,9 +58,7 @@ const float voxel_size = 0.1; // m or lidar units
 const int histogram_size = 30,
           histogram_offset = 40;
 const int normalization_patch_radius = 2, // pixels
-          min_colour_samples = 15,
-          specularity_colour_threshold = 10,
-          specular_within_threshold_limit = 10;
+          min_colour_samples = 20;
 
 // thresholds
 const double lidar_near_sqr_thresh = 4, // m^2
@@ -181,7 +183,7 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     extract.setNegative(true);
     extract.filter(*stuff_cloud);
 
-
+/*
     ModelCoefficients coefficients;
     PointIndices::Ptr inliers(new PointIndices);
     // segment it!
@@ -213,11 +215,11 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     proj.setInputCloud(ground_plane);
     proj.setModelCoefficients(boost::make_shared<ModelCoefficients>(coefficients));
     proj.filter(*ground_cloud);
-/*
+/*/
     double pose_z = (*pose)(2,3);
     cerr << pose_z << endl;
     vector<int> histogram(histogram_size, 0);
-    for(auto p : tmp->points) {
+    for(auto p : ground_in->points) {
         double x = p.x - (*pose)(0,3),
                y = p.y - (*pose)(1,3),
                z = p.z - (*pose)(2,3);
@@ -234,14 +236,14 @@ void getGroundPlane(Cloud::ConstPtr in_cloud,
     }
     double ground_height = (mode - histogram_offset) * ground_distance_thresh;
     cerr << ground_height << endl;
-    for(auto p : tmp->points) {
+    for(auto p : ground_in->points) {
         if(abs(p.z - pose_z - ground_height) < ground_distance_thresh) {
             ground_cloud->push_back(p);
         } else {
             stuff_cloud->push_back(p);
         }
     }
-*/
+//*/
 }
 // Clean and transform lidar cloud into global frame with dewarp
 void processLidar(Cloud::Ptr lidar, ts frame) {
@@ -340,41 +342,34 @@ Mat processFrame(const deque<Mat> &camera_frames,
         //circle(out, other_pixels[i], 3, Scalar(255, 255, 0), 1, 8, 0);
     }
 
-    map<Point, vector<uchar>> ground_colours;
+    map<Point, vector<double>> ground_colours;
     for(int i=camera_frames.size()-1; i>=0; i--) {
         vector<int> valid_indices;
         auto ground_pixels2 = project(ground, pose_frames[i], valid_indices);
         for(int j=0; j<valid_indices.size(); j++) {
-            if (ground_pixels2[j].x < normalization_patch_radius || ground_pixels2[j].x + normalization_patch_radius >= out.cols ||
-                ground_pixels2[j].y < normalization_patch_radius || ground_pixels2[j].y + normalization_patch_radius >= out.rows) {
-                continue;
-            }
-            auto colour = camera_frames[i].at<uchar>(ground_pixels2[j]);
-            double sum = 0;
-            for (int a=-normalization_patch_radius; a <= normalization_patch_radius; a++) {
-                for (int b=-normalization_patch_radius; b <= normalization_patch_radius; b++) {
-                    double s = camera_frames[i].at<uchar>(ground_pixels2[j].y + b, ground_pixels2[j].x + a);
-                    sum += s*s;
-                }
-            }
-            colour /= sqrt(sum);
+            //if (ground_pixels2[j].x < normalization_patch_radius || ground_pixels2[j].x + normalization_patch_radius >= out.cols ||
+            //    ground_pixels2[j].y < normalization_patch_radius || ground_pixels2[j].y + normalization_patch_radius >= out.rows) {
+            //    continue;
+            //}
+            double colour = camera_frames[i].at<uchar>(ground_pixels2[j]);
+            //double sum = 0;
+            //for (int a=-normalization_patch_radius; a <= normalization_patch_radius; a++) {
+            //    for (int b=-normalization_patch_radius; b <= normalization_patch_radius; b++) {
+            //        sum += camera_frames[i].at<uchar>(ground_pixels2[j].y + b, ground_pixels2[j].x + a);
+            //    }
+            //}
+            //double area = (2*normalization_patch_radius+1)*(2*normalization_patch_radius+1);
+            //colour /= sum/area;
             ground_colours[ground_pixels[valid_indices[j]]].push_back(colour);
         }
     }
     for(auto p : ground_colours) {
-        vector<uchar> colours(p.second.begin(), p.second.end());
+        vector<double> colours(p.second.begin(), p.second.end());
         if (colours.size() < min_colour_samples) continue;
-        sort(colours.begin(), colours.end());
-        int front = 0, back = 0, mx = 1;
-        while(front < colours.size()) {
-          while(back < front && colours[front] - colours[back] > specularity_colour_threshold) back++;
-          mx = max(mx, front-back+1);
-          front++;
-        }
-        if (mx <= specular_within_threshold_limit) {
-          cout << mx << endl;
-          circle(out, p.first, 3, Scalar(0, 255, 0), 1, 8, 0);
-        }
+        accumulator_set<double, stats<tag::variance(lazy)> > acc;
+        for(auto c : colours) acc(c);
+        double v = variance(acc);
+        circle(out, p.first, 3, Scalar(max(0., 255-v/150*255), 0, 255), 1, 8, 0);
     }
     return out;
 }
